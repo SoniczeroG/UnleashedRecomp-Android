@@ -428,6 +428,7 @@ namespace plume {
         // flags), and every shader's unsized UniformConstant descriptor arrays are rewritten at
         // shader-module creation into fixed-size arrays matching those bindings.
         bool fixedDescriptorArrays = false;
+        bool depthClampSupported = false;
         bool sampledImageArrayDynamicIndexing = false;
         uint32_t fixedSampledImageArraySize = 0;
         uint32_t fixedSamplerArraySize = 0;

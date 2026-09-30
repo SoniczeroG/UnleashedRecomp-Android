@@ -1586,7 +1586,9 @@ namespace plume {
 
         VkPipelineRasterizationStateCreateInfo rasterization = {};
         rasterization.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rasterization.depthClampEnable = !desc.depthClipEnabled;
+        // depthClampEnable requires the depthClamp device feature, which some drivers (e.g. stock
+        // Mali Bifrost) don't support; requesting it anyway makes pipeline creation fail.
+        rasterization.depthClampEnable = !desc.depthClipEnabled && device->depthClampSupported;
         rasterization.rasterizerDiscardEnable = VK_FALSE;
         rasterization.polygonMode = VK_POLYGON_MODE_FILL;
         rasterization.lineWidth = 1.0f;
@@ -1728,7 +1730,9 @@ namespace plume {
 
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X (%d).\n", res, int32_t(res));
+            fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X (%d) [stages=%u rt=%u depthFormat=%d samples=%u depthClamp=%d depthWrite=%d inputs=%u specConsts=%u].\n",
+                res, int32_t(res), uint32_t(stages.size()), desc.renderTargetCount, int(desc.depthTargetFormat), desc.multisampling.sampleCount,
+                int(rasterization.depthClampEnable), int(desc.depthWriteEnabled), desc.inputElementsCount, desc.specConstantsCount);
             return;
         }
     }
@@ -4096,6 +4100,13 @@ namespace plume {
         const bool descriptorIndexing = descriptorIndexingSupported && !forceFixedDescriptorArrays;
         fixedDescriptorArrays = !descriptorIndexing;
         sampledImageArrayDynamicIndexing = deviceFeatures.features.shaderSampledImageArrayDynamicIndexing;
+        depthClampSupported = deviceFeatures.features.depthClamp;
+
+        fprintf(stderr, "Device features/limits: depthClamp=%d independentBlend=%d sampleRateShading=%d fragmentStoresAndAtomics=%d maxBoundDescriptorSets=%u maxPerStageResources=%u maxPushConstantsSize=%u framebufferDepthSampleCounts=0x%X.\n",
+            int(deviceFeatures.features.depthClamp), int(deviceFeatures.features.independentBlend), int(deviceFeatures.features.sampleRateShading),
+            int(deviceFeatures.features.fragmentStoresAndAtomics), physicalDeviceProperties.limits.maxBoundDescriptorSets,
+            physicalDeviceProperties.limits.maxPerStageResources, physicalDeviceProperties.limits.maxPushConstantsSize,
+            uint32_t(physicalDeviceProperties.limits.framebufferDepthSampleCounts));
 
         fprintf(stderr, "Descriptor indexing: partiallyBound=%d variableDescriptorCount=%d runtimeDescriptorArray=%d sampledImageUpdateAfterBind=%d shaderSampledImageArrayDynamicIndexing=%d shaderInt64=%d -> %s%s.\n",
             int(indexingPartiallyBound), int(indexingVariableCount), int(indexingRuntimeArray), int(indexingSampledImageUpdateAfterBind),
