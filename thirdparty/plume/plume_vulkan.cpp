@@ -10,6 +10,7 @@
 
 #include "plume_vulkan.h"
 #include "plume_vulkan_spirv_fixup.h"
+#include "plume_vulkan_selftest.h"
 
 #include <algorithm>
 #include <cmath>
@@ -4384,6 +4385,12 @@ namespace plume {
                 fixedSampledImageArraySize, fixedSamplerArraySize,
                 physicalDeviceProperties.limits.maxDescriptorSetSampledImages, physicalDeviceProperties.limits.maxDescriptorSetSamplers,
                 physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages, physicalDeviceProperties.limits.maxPerStageDescriptorSamplers);
+
+            // Diagnostic matrix (a few tiny pipelines, milliseconds) to pin down which descriptor
+            // construct this driver rejects. Skipped when PLUME_SKIP_DESCRIPTOR_SELFTEST is set.
+            if (getenv("PLUME_SKIP_DESCRIPTOR_SELFTEST") == nullptr) {
+                selftest::runDescriptorSelfTest(vk);
+            }
         }
         capabilities.bufferDeviceAddress = bufferDeviceAddress;
         capabilities.presentWait = presentWait;
