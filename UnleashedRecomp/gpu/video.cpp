@@ -52,19 +52,6 @@
 #define UNLEASHED_RECOMP
 #include "../../tools/XenosRecomp/XenosRecomp/shader_common.h"
 
-// One-shot startup breadcrumbs: logs the first time each point is reached, with the calling
-// thread id, so a stall before the first presented frame can be located from log.txt alone
-// (the watchdog's thread dump lists threads by the same id).
-#if defined(__ANDROID__)
-#include <pthread.h>
-#include <unistd.h>
-#define STARTUP_BREADCRUMB(msg) \
-    do { static std::atomic<bool> s_breadcrumbDone{ false }; \
-         if (!s_breadcrumbDone.exchange(true)) LOGF("startup: {} (tid {})", msg, int(gettid())); } while (0)
-#else
-#define STARTUP_BREADCRUMB(msg) do { } while (0)
-#endif
-
 #ifdef UNLEASHED_RECOMP_D3D12
 #include "shader/blend_color_alpha_ps.hlsl.dxil.h"
 #include "shader/copy_vs.hlsl.dxil.h"
@@ -872,9 +859,7 @@ PPC_FUNC_IMPL(__imp__sub_824ECA00);
 PPC_FUNC(sub_824ECA00)
 {
     // Guard against thread ownership changes when between command lists.
-    STARTUP_BREADCRUMB("game thread waiting for the first command list");
     g_readyForCommands.wait(false);
-    STARTUP_BREADCRUMB("game thread got the first command list");
     g_presentThreadId = std::this_thread::get_id();
     __imp__sub_824ECA00(ctx, base);
 }
@@ -1470,10 +1455,8 @@ static void ExecuteCopyCommandList(const T& function)
     g_copyCommandList->begin();
     function();
     g_copyCommandList->end();
-    STARTUP_BREADCRUMB("first copy command list submitted, waiting for its fence");
     g_copyQueue->executeCommandLists(g_copyCommandList.get(), g_copyCommandFence.get());
     g_copyQueue->waitForCommandFence(g_copyCommandFence.get());
-    STARTUP_BREADCRUMB("first copy command list completed");
 }
 
 static constexpr uint32_t PITCH_ALIGNMENT = 0x100;
@@ -1741,9 +1724,7 @@ skipResizeAttempt:
         AndroidMarkVulkanStartupSuccessful();
 #endif
         g_swapChainAcquireProfiler.Begin();
-        STARTUP_BREADCRUMB("acquiring first swapchain image");
         g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[g_frame].get(), &g_backBufferIndex);
-        STARTUP_BREADCRUMB("first swapchain image acquired");
         g_swapChainAcquireProfiler.End();
     }
 
@@ -2406,7 +2387,6 @@ static uint32_t g_waitForGPUCount = 0;
 void Video::WaitForGPU()
 {
     g_waitForGPUCount++;
-    STARTUP_BREADCRUMB("first WaitForGPU");
 
     // Wait for all queued frames to finish.
     for (size_t i = 0; i < NUM_FRAMES; i++)
@@ -2423,7 +2403,6 @@ void Video::WaitForGPU()
     g_commandLists[0]->end();
     g_queue->executeCommandLists(g_commandLists[0].get(), g_commandFences[0].get());
     g_queue->waitForCommandFence(g_commandFences[0].get());
-    STARTUP_BREADCRUMB("first WaitForGPU completed");
 }
 
 static uint32_t CreateDevice(uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, be<uint32_t>* a6)
@@ -3177,7 +3156,6 @@ static std::atomic<bool> g_executedCommandList;
 
 void Video::Present()
 {
-    STARTUP_BREADCRUMB("first Present");
     // Feeds the Android hang-watchdog (no-op elsewhere): if these stop, the log.txt
     // timestamp of the last ping marks when the app froze.
     os::logger::Heartbeat();
@@ -3224,9 +3202,7 @@ void Video::Present()
     if (g_commandListStates[g_frame])
     {
         g_frameFenceProfiler.Begin();
-        STARTUP_BREADCRUMB("first frame fence wait");
         g_queue->waitForCommandFence(g_commandFences[g_frame].get());
-        STARTUP_BREADCRUMB("first frame fence wait completed");
         g_frameFenceProfiler.End();
         g_commandListStates[g_frame] = false;
 
@@ -3401,7 +3377,6 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
     }
 
     g_commandListStates[g_frame] = true;
-    STARTUP_BREADCRUMB("first frame command list submitted");
 
     g_executedCommandList = true;
     g_executedCommandList.notify_one();
@@ -3409,7 +3384,6 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
 
 static void ProcBeginCommandList(const RenderCommand& cmd)
 {
-    STARTUP_BREADCRUMB("render thread: first BeginCommandList");
     DestructTempResources();
     BeginCommandList();
 }
@@ -5674,11 +5648,6 @@ static std::thread g_renderThread([]
 #endif
 
         RenderCommand commands[32];
-
-#if defined(__ANDROID__)
-        pthread_setname_np(pthread_self(), "UR Render");
-        STARTUP_BREADCRUMB("render thread started");
-#endif
 
         while (true)
         {

@@ -219,17 +219,9 @@ static void* WatchdogThread(void*)
     constexpr double ALIVE_INTERVAL = 5.0;   // otherwise note liveness this often
     constexpr double REDUMP_INTERVAL = 15.0; // while still hung, re-dump this often
 
-    // Before the first frame: startup can legitimately take a while (first-launch patching,
-    // file checks), so only report a stall after a generous delay, then re-dump a few times.
-    constexpr double STARTUP_STALL_THRESHOLD = 30.0;
-    constexpr double STARTUP_REDUMP_INTERVAL = 60.0;
-    constexpr int STARTUP_MAX_DUMPS = 4;
-
     bool hung = false;
     double lastAliveLog = 0.0;
     double lastDump = 0.0;
-    int startupDumps = 0;
-    double lastStartupDump = 0.0;
 
     for (;;)
     {
@@ -243,23 +235,6 @@ static void* WatchdogThread(void*)
         const double last = s_lastHeartbeat.load(std::memory_order_relaxed);
         const uint64_t frames = s_frameCount.load(std::memory_order_relaxed);
         const double sinceFrame = now - last;
-
-        if (frames == 0)
-        {
-            if (now >= STARTUP_STALL_THRESHOLD && startupDumps < STARTUP_MAX_DUMPS &&
-                (startupDumps == 0 || now - lastStartupDump >= STARTUP_REDUMP_INTERVAL))
-            {
-                char line[160];
-                int m = snprintf(line, sizeof(line),
-                    "STARTUP STALL: no frame presented yet after %.1fs. Thread dump follows:", now);
-                WriteLogRecord("[watchdog]", nullptr, line, m > 0 ? size_t(m) : 0);
-                DumpThreads();
-                startupDumps++;
-                lastStartupDump = now;
-            }
-
-            continue;
-        }
 
         if (sinceFrame > HANG_THRESHOLD)
         {
@@ -517,15 +492,6 @@ void os::logger::Init()
     WriteLogRecord("[build]", nullptr, BuildId, sizeof(BuildId) - 1);
     LogDeviceInfo();
     InstallCrashHandler();
-
-    // Start the watchdog right away (not on the first frame) so a stall before the first
-    // presented frame still produces a thread dump; it waits for frames before hang checks.
-    std::call_once(s_watchdogOnce, []()
-    {
-        pthread_t watchdogThread;
-        if (pthread_create(&watchdogThread, nullptr, WatchdogThread, nullptr) == 0)
-            pthread_detach(watchdogThread);
-    });
 }
 
 void os::logger::Log(const std::string_view str, ELogType type, const char* func)
@@ -572,11 +538,7 @@ void os::logger::SetWatchdogSuspended(bool suspended)
 void os::logger::Heartbeat()
 {
     s_lastHeartbeat.store(MonotonicSeconds() - s_startSeconds, std::memory_order_relaxed);
-    if (s_frameCount.fetch_add(1, std::memory_order_relaxed) == 0)
-    {
-        static constexpr char FirstFrame[] = "first frame presented";
-        WriteLogRecord("[heartbeat]", nullptr, FirstFrame, sizeof(FirstFrame) - 1);
-    }
+    s_frameCount.fetch_add(1, std::memory_order_relaxed);
 
     // Start the watchdog only once frames are actually being presented, so the long,
     // frame-less startup/first-load phase can't trip a false hang.
