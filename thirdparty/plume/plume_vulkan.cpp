@@ -9,6 +9,7 @@
 #define VOLK_IMPLEMENTATION 
 
 #include "plume_vulkan.h"
+#include "plume_vulkan_spirv_fixup.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1240,7 +1241,19 @@ namespace plume {
         
         thread_local std::vector<VkDescriptorBindingFlags> bindingFlags;
         VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
-        if (descriptorSetDesc.lastRangeIsBoundless && (descriptorSetDesc.descriptorRangesCount > 0)) {
+        if (descriptorSetDesc.lastRangeIsBoundless && (descriptorSetDesc.descriptorRangesCount > 0) && device->fixedDescriptorArrays) {
+            // Remember the size the application actually chose for its "boundless" ranges so shader
+            // modules created afterwards get unsized arrays rewritten to exactly this length.
+            const RenderDescriptorRange &lastRange = descriptorSetDesc.descriptorRanges[descriptorSetDesc.descriptorRangesCount - 1];
+            if (lastRange.type == RenderDescriptorRangeType::TEXTURE) {
+                device->fixedSampledImageArraySize = lastRange.count;
+            }
+            else if (lastRange.type == RenderDescriptorRangeType::SAMPLER) {
+                device->fixedSamplerArraySize = lastRange.count;
+            }
+        }
+
+        if (descriptorSetDesc.lastRangeIsBoundless && (descriptorSetDesc.descriptorRangesCount > 0) && !device->fixedDescriptorArrays) {
             bindingFlags.clear();
             bindingFlags.resize(descriptorSetDesc.descriptorRangesCount, 0);
             bindingFlags[descriptorSetDesc.descriptorRangesCount - 1] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
@@ -1342,6 +1355,25 @@ namespace plume {
         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         shaderInfo.pCode = reinterpret_cast<const uint32_t *>(data);
         shaderInfo.codeSize = size;
+
+        // Fixed-size descriptor array fallback: rewrite unsized descriptor arrays to match the
+        // fixed-size bindings created for "boundless" ranges on this device.
+        std::vector<uint32_t> rewrittenCode;
+        if (device->fixedDescriptorArrays && ((size % sizeof(uint32_t)) == 0)) {
+            rewrittenCode.resize(size / sizeof(uint32_t));
+            memcpy(rewrittenCode.data(), data, size);
+
+            const spirv_fixup::Result fixup = spirv_fixup::rewriteRuntimeDescriptorArrays(rewrittenCode,
+                device->fixedSampledImageArraySize, device->fixedSamplerArraySize, device->sampledImageArrayDynamicIndexing);
+
+            if (fixup.error) {
+                fprintf(stderr, "SPIR-V descriptor array rewrite failed to parse the module; using it unmodified.\n");
+            }
+            else if (fixup.modified) {
+                shaderInfo.pCode = rewrittenCode.data();
+                shaderInfo.codeSize = rewrittenCode.size() * sizeof(uint32_t);
+            }
+        }
         VkResult res = vkCreateShaderModule(device->vk, &shaderInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateShaderModule failed with error code 0x%X (%d).\n", res, int32_t(res));
@@ -1955,7 +1987,10 @@ namespace plume {
 
         setLayout = new VulkanDescriptorSetLayout(device, desc);
 
-        descriptorPool = createDescriptorPool(device, typeCounts, desc.lastRangeIsBoundless);
+        // In fixed-array mode the boundless range is an ordinary binding of boundlessRangeSize
+        // descriptors, so neither the update-after-bind pool nor a variable count is used.
+        const bool variableBoundless = desc.lastRangeIsBoundless && !device->fixedDescriptorArrays;
+        descriptorPool = createDescriptorPool(device, typeCounts, variableBoundless);
         if (descriptorPool == VK_NULL_HANDLE) {
             return;
         }
@@ -1967,7 +2002,7 @@ namespace plume {
         allocateInfo.descriptorSetCount = 1;
 
         VkDescriptorSetVariableDescriptorCountAllocateInfo countInfo = {};
-        if (desc.lastRangeIsBoundless) {
+        if (variableBoundless) {
             countInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO;
             countInfo.pDescriptorCounts = &boundlessRangeSize;
             countInfo.descriptorSetCount = 1;
@@ -4048,9 +4083,25 @@ namespace plume {
             vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
         }
 
-        const bool descriptorIndexing = coreVulkan12
-            ? (vulkan12Features.descriptorBindingPartiallyBound && vulkan12Features.descriptorBindingVariableDescriptorCount && vulkan12Features.runtimeDescriptorArray)
-            : (indexingFeatures.descriptorBindingPartiallyBound && indexingFeatures.descriptorBindingVariableDescriptorCount && indexingFeatures.runtimeDescriptorArray);
+        const bool indexingPartiallyBound = coreVulkan12 ? bool(vulkan12Features.descriptorBindingPartiallyBound) : bool(indexingFeatures.descriptorBindingPartiallyBound);
+        const bool indexingVariableCount = coreVulkan12 ? bool(vulkan12Features.descriptorBindingVariableDescriptorCount) : bool(indexingFeatures.descriptorBindingVariableDescriptorCount);
+        const bool indexingRuntimeArray = coreVulkan12 ? bool(vulkan12Features.runtimeDescriptorArray) : bool(indexingFeatures.runtimeDescriptorArray);
+        const bool indexingSampledImageUpdateAfterBind = coreVulkan12 ? bool(vulkan12Features.descriptorBindingSampledImageUpdateAfterBind) : bool(indexingFeatures.descriptorBindingSampledImageUpdateAfterBind);
+        const bool descriptorIndexingSupported = indexingPartiallyBound && indexingVariableCount && indexingRuntimeArray;
+
+        // PLUME_FORCE_FIXED_DESCRIPTOR_ARRAYS=1 forces the fixed-size fallback even on drivers that
+        // advertise descriptor indexing (for drivers that advertise it but fail to compile it).
+        const char *forceFixedEnv = getenv("PLUME_FORCE_FIXED_DESCRIPTOR_ARRAYS");
+        const bool forceFixedDescriptorArrays = (forceFixedEnv != nullptr) && (forceFixedEnv[0] != '\0') && (forceFixedEnv[0] != '0');
+        const bool descriptorIndexing = descriptorIndexingSupported && !forceFixedDescriptorArrays;
+        fixedDescriptorArrays = !descriptorIndexing;
+        sampledImageArrayDynamicIndexing = deviceFeatures.features.shaderSampledImageArrayDynamicIndexing;
+
+        fprintf(stderr, "Descriptor indexing: partiallyBound=%d variableDescriptorCount=%d runtimeDescriptorArray=%d sampledImageUpdateAfterBind=%d shaderSampledImageArrayDynamicIndexing=%d shaderInt64=%d -> %s%s.\n",
+            int(indexingPartiallyBound), int(indexingVariableCount), int(indexingRuntimeArray), int(indexingSampledImageUpdateAfterBind),
+            int(sampledImageArrayDynamicIndexing), int(deviceFeatures.features.shaderInt64),
+            descriptorIndexing ? "bindless (runtime arrays)" : "fixed-size descriptor array fallback",
+            forceFixedDescriptorArrays ? " (forced)" : "");
 
         VkPhysicalDeviceDescriptorIndexingProperties indexingProperties = {};
         if (descriptorIndexing) {
@@ -4300,6 +4351,28 @@ namespace plume {
         else {
             capabilities.maxSampledImageDescriptors = std::min(physicalDeviceProperties.limits.maxDescriptorSetSampledImages, physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages);
             capabilities.maxSamplerDescriptors = std::min(physicalDeviceProperties.limits.maxDescriptorSetSamplers, physicalDeviceProperties.limits.maxPerStageDescriptorSamplers);
+
+            // Optional override of the fixed array sizes (testing aid: e.g. to stay within
+            // maxPerStageDescriptorSampledImages when one image set is bound to several set slots).
+            auto readSizeOverride = [](const char *name, uint32_t current) {
+                const char *value = getenv(name);
+                if ((value == nullptr) || (value[0] == '\0')) {
+                    return current;
+                }
+
+                const unsigned long parsed = strtoul(value, nullptr, 10);
+                return (parsed > 0) ? std::min(uint32_t(parsed), current) : current;
+            };
+
+            capabilities.maxSampledImageDescriptors = readSizeOverride("PLUME_FIXED_SAMPLED_IMAGE_ARRAY_SIZE", capabilities.maxSampledImageDescriptors);
+            capabilities.maxSamplerDescriptors = readSizeOverride("PLUME_FIXED_SAMPLER_ARRAY_SIZE", capabilities.maxSamplerDescriptors);
+            fixedSampledImageArraySize = capabilities.maxSampledImageDescriptors;
+            fixedSamplerArraySize = capabilities.maxSamplerDescriptors;
+
+            fprintf(stderr, "Fixed descriptor arrays: %u sampled images, %u samplers (limits: set %u/%u, per-stage %u/%u).\n",
+                fixedSampledImageArraySize, fixedSamplerArraySize,
+                physicalDeviceProperties.limits.maxDescriptorSetSampledImages, physicalDeviceProperties.limits.maxDescriptorSetSamplers,
+                physicalDeviceProperties.limits.maxPerStageDescriptorSampledImages, physicalDeviceProperties.limits.maxPerStageDescriptorSamplers);
         }
         capabilities.bufferDeviceAddress = bufferDeviceAddress;
         capabilities.presentWait = presentWait;

@@ -422,6 +422,16 @@ namespace plume {
         bool nullDescriptorSupported = false;
         bool samplerMirrorClampToEdgeSupported = false;
 
+        // Fixed-size descriptor array fallback for drivers without descriptor indexing
+        // (e.g. stock Mali Bifrost). When enabled, "boundless" descriptor ranges are created as
+        // ordinary fixed-size bindings (no update-after-bind / partially-bound / variable-count
+        // flags), and every shader's unsized UniformConstant descriptor arrays are rewritten at
+        // shader-module creation into fixed-size arrays matching those bindings.
+        bool fixedDescriptorArrays = false;
+        bool sampledImageArrayDynamicIndexing = false;
+        uint32_t fixedSampledImageArraySize = 0;
+        uint32_t fixedSamplerArraySize = 0;
+
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
         ~VulkanDevice() override;
         std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;

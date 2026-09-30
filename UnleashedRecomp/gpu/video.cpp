@@ -393,9 +393,16 @@ struct TextureDescriptorAllocator
 {
     Mutex mutex;
     uint32_t capacity = TEXTURE_DESCRIPTOR_NULL_COUNT;
+    // Size of the texture descriptor heap. Indices at or beyond it must never be handed out:
+    // on devices with small (fixed-size) heaps that would write past the end of the set.
+    uint32_t limit = UINT32_MAX;
+    uint32_t overflowCount = 0;
     std::vector<uint32_t> freed;
 
-    uint32_t allocate()
+    // On exhaustion returns nullFallback (one of the reserved blank-texture slots), so the
+    // texture samples as blank instead of corrupting the heap. setTexture on a reserved slot
+    // is skipped by SetTextureDescriptor, and free() ignores reserved slots.
+    uint32_t allocate(uint32_t nullFallback = TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D)
     {
         std::lock_guard lock(mutex);
 
@@ -405,10 +412,17 @@ struct TextureDescriptorAllocator
             value = freed.back();
             freed.pop_back();
         }
-        else
+        else if (capacity < limit)
         {
             value = capacity;
             ++capacity;
+        }
+        else
+        {
+            if ((overflowCount++ % 256) == 0)
+                LOGF_WARNING("Texture descriptor heap exhausted ({} slots): {} texture(s) will render blank.", limit, overflowCount);
+
+            value = nullFallback;
         }
 
         return value;
@@ -416,16 +430,40 @@ struct TextureDescriptorAllocator
 
     void free(uint32_t value)
     {
-        assert(value != NULL);
+        if (value < TEXTURE_DESCRIPTOR_NULL_COUNT)
+            return;
+
         std::lock_guard lock(mutex);
         freed.push_back(value);
     }
 };
 
+static uint32_t GetNullTextureDescriptorIndex(RenderTextureViewDimension dimension)
+{
+    switch (dimension)
+    {
+    case RenderTextureViewDimension::TEXTURE_3D:
+        return TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D;
+    case RenderTextureViewDimension::TEXTURE_CUBE:
+        return TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE;
+    default:
+        return TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D;
+    }
+}
+
 static std::unique_ptr<RenderTexture> g_blankTextures[TEXTURE_DESCRIPTOR_NULL_COUNT];
 static std::unique_ptr<RenderTextureView> g_blankTextureViews[TEXTURE_DESCRIPTOR_NULL_COUNT];
 
 static TextureDescriptorAllocator g_textureDescriptorAllocator;
+
+// Writes an allocated texture descriptor; reserved blank slots (returned on heap exhaustion) are left untouched.
+static void SetTextureDescriptor(uint32_t descriptorIndex, const RenderTexture* texture, RenderTextureLayout layout, const RenderTextureView* textureView = nullptr)
+{
+    if (descriptorIndex < TEXTURE_DESCRIPTOR_NULL_COUNT)
+        return;
+
+    g_textureDescriptorSet->setTexture(descriptorIndex, texture, layout, textureView);
+}
 
 static std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
 static xxHashMap<std::unique_ptr<RenderPipeline>> g_pipelines;
@@ -1502,7 +1540,7 @@ static void CreateImGuiBackend()
     g_imFontTexture->textureView = g_imFontTexture->texture->createTextureView(textureViewDesc);
 
     g_imFontTexture->descriptorIndex = g_textureDescriptorAllocator.allocate();
-    g_textureDescriptorSet->setTexture(g_imFontTexture->descriptorIndex, g_imFontTexture->texture, RenderTextureLayout::SHADER_READ, g_imFontTexture->textureView.get());
+    SetTextureDescriptor(g_imFontTexture->descriptorIndex, g_imFontTexture->texture, RenderTextureLayout::SHADER_READ, g_imFontTexture->textureView.get());
 #endif
 
     io.Fonts->SetTexID(g_imFontTexture.get());
@@ -1691,7 +1729,7 @@ static void BeginCommandList()
                 Video::WaitForGPU(); // Fine to wait for GPU, this'll only happen during resize.
 
                 g_intermediaryBackBufferTexture = g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
-                g_textureDescriptorSet->setTexture(g_intermediaryBackBufferTextureDescriptorIndex, g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ);
+                SetTextureDescriptor(g_intermediaryBackBufferTextureDescriptorIndex, g_intermediaryBackBufferTexture.get(), RenderTextureLayout::SHADER_READ);
 
                 g_intermediaryBackBufferTextureWidth = width;
                 g_intermediaryBackBufferTextureHeight = height;
@@ -1787,6 +1825,44 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
 
 #ifdef UNLEASHED_RECOMP_D3D12
     g_vulkan = DetectWine() || Config::GraphicsAPI == EGraphicsAPI::Vulkan;
+#endif
+
+#if defined(__ANDROID__)
+    // Fixed-size descriptor array fallback testing hooks (read by plume at device creation):
+    //  - force_fixed_descriptors.txt: use the fallback even if descriptor indexing is advertised.
+    //  - fixed_descriptor_slots.txt: first line caps the fixed texture array size (e.g. "85" keeps
+    //    three texture set slots within a 256 maxPerStageDescriptorSampledImages limit).
+    {
+        auto findMarker = [](const char* name) -> std::filesystem::path
+        {
+            std::error_code ec;
+            for (const auto& dir : { os::android::GetExternalFilesDir() / "driver_import", os::android::GetInternalFilesDir() })
+            {
+                if (std::filesystem::exists(dir / name, ec))
+                    return dir / name;
+            }
+
+            return {};
+        };
+
+        if (!findMarker("force_fixed_descriptors.txt").empty())
+        {
+            setenv("PLUME_FORCE_FIXED_DESCRIPTOR_ARRAYS", "1", 1);
+            LOG_WARNING("force_fixed_descriptors.txt present: forcing the fixed-size descriptor array fallback.");
+        }
+
+        auto slotsPath = findMarker("fixed_descriptor_slots.txt");
+        if (!slotsPath.empty())
+        {
+            std::ifstream slotsFile(slotsPath);
+            uint32_t slots = 0;
+            if (slotsFile >> slots && slots > TEXTURE_DESCRIPTOR_NULL_COUNT)
+            {
+                setenv("PLUME_FIXED_SAMPLED_IMAGE_ARRAY_SIZE", std::to_string(slots).c_str(), 1);
+                LOGF_WARNING("fixed_descriptor_slots.txt present: fixed texture descriptor arrays capped at {}.", slots);
+            }
+        }
+    }
 #endif
 
     // Attempt to create the possible backends using a vector of function pointers. Whichever succeeds first will be the chosen API.
@@ -1973,6 +2049,14 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     if (g_capabilities.maxSamplerDescriptors != 0)
         g_samplerDescriptorSize = uint32_t(std::min<size_t>(SAMPLER_DESCRIPTOR_SIZE, g_capabilities.maxSamplerDescriptors));
 
+    g_textureDescriptorAllocator.limit = g_textureDescriptorSize;
+
+    if (!g_capabilities.descriptorIndexing)
+    {
+        LOGF_WARNING("Descriptor indexing unavailable: using fixed-size descriptor arrays ({} textures, {} samplers). Experimental.",
+            g_textureDescriptorSize, g_samplerDescriptorSize);
+    }
+
     if (g_textureDescriptorSize < TEXTURE_DESCRIPTOR_SIZE || g_samplerDescriptorSize < SAMPLER_DESCRIPTOR_SIZE)
     {
         LOGF_WARNING("Descriptor set sizes clamped to device limits: {} textures, {} samplers.",
@@ -2125,6 +2209,17 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
         g_textureDescriptorSet->setTexture(i, texture.get(), RenderTextureLayout::SHADER_READ, textureView.get());
     }
 
+    // Without descriptor indexing the heap is an ordinary binding (not partially bound), so every
+    // slot must hold a valid descriptor: pre-fill the unused ones with the blank 2D texture.
+    if (!g_capabilities.descriptorIndexing)
+    {
+        for (uint32_t i = TEXTURE_DESCRIPTOR_NULL_COUNT; i < g_textureDescriptorSize; i++)
+        {
+            g_textureDescriptorSet->setTexture(i, g_blankTextures[TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D].get(),
+                RenderTextureLayout::SHADER_READ, g_blankTextureViews[TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D].get());
+        }
+    }
+
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
@@ -2138,6 +2233,12 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     descriptorIndex = 1;
     sampler = g_device->createSampler(g_samplerDescs[0]);
     g_samplerDescriptorSet->setSampler(0, sampler.get());
+
+    if (!g_capabilities.descriptorIndexing)
+    {
+        for (uint32_t i = 1; i < g_samplerDescriptorSize; i++)
+            g_samplerDescriptorSet->setSampler(i, sampler.get());
+    }
 
     pipelineLayoutBuilder.addDescriptorSet(descriptorSetBuilder);
 
@@ -3383,9 +3484,9 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
     texture->depth = depth;
     texture->format = desc.format;
     texture->viewDimension = viewDesc.dimension;
-    texture->descriptorIndex = g_textureDescriptorAllocator.allocate();
+    texture->descriptorIndex = g_textureDescriptorAllocator.allocate(GetNullTextureDescriptorIndex(viewDesc.dimension));
 
-    g_textureDescriptorSet->setTexture(texture->descriptorIndex, texture->texture, RenderTextureLayout::SHADER_READ, texture->textureView.get());
+    SetTextureDescriptor(texture->descriptorIndex, texture->texture, RenderTextureLayout::SHADER_READ, texture->textureView.get());
    
 #ifdef _DEBUG 
     texture->texture->setName(fmt::format("Texture {:X}", g_memory.MapVirtual(texture)));
@@ -3453,7 +3554,7 @@ static GuestSurface* CreateSurface(uint32_t width, uint32_t height, uint32_t for
     viewDesc.mipLevels = 1;
     surface->textureView = surface->textureHolder->createTextureView(viewDesc);
     surface->descriptorIndex = g_textureDescriptorAllocator.allocate();
-    g_textureDescriptorSet->setTexture(surface->descriptorIndex, surface->textureHolder.get(), RenderTextureLayout::SHADER_READ, surface->textureView.get());
+    SetTextureDescriptor(surface->descriptorIndex, surface->textureHolder.get(), RenderTextureLayout::SHADER_READ, surface->textureView.get());
 
 #ifdef _DEBUG 
     surface->texture->setName(fmt::format("{} {:X}", desc.flags & RenderTextureFlag::RENDER_TARGET ? "Render Target" : "Depth Stencil", g_memory.MapVirtual(surface)));
@@ -4645,9 +4746,18 @@ static void ProcSetSamplerState(const RenderCommand& cmd)
         if (descriptorIndex == NULL)
         {
             descriptorIndex = g_samplerStates.size();
-            sampler = g_device->createSampler(samplerDesc);
 
-            g_samplerDescriptorSet->setSampler(descriptorIndex - 1, sampler.get());
+            if ((descriptorIndex - 1) < g_samplerDescriptorSize)
+            {
+                sampler = g_device->createSampler(samplerDesc);
+                g_samplerDescriptorSet->setSampler(descriptorIndex - 1, sampler.get());
+            }
+            else
+            {
+                // Sampler heap exhausted (small fixed-size heaps): fall back to the default sampler.
+                LOGF_WARNING("Sampler descriptor heap exhausted ({} slots): using the default sampler.", g_samplerDescriptorSize);
+                descriptorIndex = 1;
+            }
         }
 
         SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.samplerIndices[args.index], descriptorIndex - 1);
@@ -6174,8 +6284,8 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             viewDesc.dimension = RenderTextureViewDimension::TEXTURE_CUBE;
 
         texture.textureView = texture.texture->createTextureView(viewDesc);
-        texture.descriptorIndex = g_textureDescriptorAllocator.allocate();
-        g_textureDescriptorSet->setTexture(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ, texture.textureView.get());
+        texture.descriptorIndex = g_textureDescriptorAllocator.allocate(GetNullTextureDescriptorIndex(viewDesc.dimension));
+        SetTextureDescriptor(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ, texture.textureView.get());
 
         texture.width = desc.width;
         texture.height = desc.height;
@@ -6362,7 +6472,7 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
             texture.layout = RenderTextureLayout::COPY_DEST;
 
             texture.descriptorIndex = g_textureDescriptorAllocator.allocate();
-            g_textureDescriptorSet->setTexture(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ);
+            SetTextureDescriptor(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ);
 
             uint32_t rowPitch = (width * 4 + PITCH_ALIGNMENT - 1) & ~(PITCH_ALIGNMENT - 1);
             uint32_t slicePitch = rowPitch * height;
