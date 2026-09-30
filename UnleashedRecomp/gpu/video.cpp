@@ -456,6 +456,39 @@ static std::unique_ptr<RenderTextureView> g_blankTextureViews[TEXTURE_DESCRIPTOR
 
 static TextureDescriptorAllocator g_textureDescriptorAllocator;
 
+// Without descriptor indexing there is no update-after-bind: drivers may snapshot a descriptor set
+// when it is bound (stock Mali does), so descriptors written after the bind are invisible to later
+// draws in the same command list. Every heap write bumps this generation; draws rebind the heaps
+// when it has moved since their last bind.
+static std::atomic<uint32_t> g_descriptorGeneration{ 0 };
+static uint32_t g_boundDescriptorGeneration = 0;
+
+static void BumpDescriptorGeneration()
+{
+    g_descriptorGeneration.fetch_add(1, std::memory_order_release);
+}
+
+// Binds the main texture/sampler heaps (sets 0-3 of g_pipelineLayout) and records the generation.
+static void BindMainDescriptorHeaps(RenderCommandList* commandList)
+{
+    g_boundDescriptorGeneration = g_descriptorGeneration.load(std::memory_order_acquire);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+}
+
+// Rebinds the main heaps if any descriptor was written since they were last bound (fixed-array
+// fallback only; with descriptor indexing the sets are update-after-bind).
+static void RebindMainDescriptorHeapsIfStale(RenderCommandList* commandList)
+{
+    if (g_capabilities.descriptorIndexing)
+        return;
+
+    if (g_descriptorGeneration.load(std::memory_order_acquire) != g_boundDescriptorGeneration)
+        BindMainDescriptorHeaps(commandList);
+}
+
 // Writes an allocated texture descriptor; reserved blank slots (returned on heap exhaustion) are left untouched.
 static void SetTextureDescriptor(uint32_t descriptorIndex, const RenderTexture* texture, RenderTextureLayout layout, const RenderTextureView* textureView = nullptr)
 {
@@ -463,6 +496,7 @@ static void SetTextureDescriptor(uint32_t descriptorIndex, const RenderTexture* 
         return;
 
     g_textureDescriptorSet->setTexture(descriptorIndex, texture, layout, textureView);
+    BumpDescriptorGeneration();
 }
 
 static std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
@@ -1771,10 +1805,7 @@ static void BeginCommandList()
     commandList->resetQueryPool(g_queryPools[g_frame].get(), 0, NUM_QUERIES);
     commandList->writeTimestamp(g_queryPools[g_frame].get(), 0);
     commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
-    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
-    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
-    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
-    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    BindMainDescriptorHeaps(commandList.get());
 
     g_readyForCommands = true;
     g_readyForCommands.notify_one();
@@ -2944,6 +2975,7 @@ static void ProcDrawImGui(const RenderCommand& cmd)
 
     commandList->setGraphicsPipelineLayout(g_imPipelineLayout.get());
     commandList->setPipeline(pipeline);
+    uint32_t imBoundDescriptorGeneration = g_descriptorGeneration.load(std::memory_order_acquire);
     commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
     commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 1);
 
@@ -3069,6 +3101,13 @@ static void ProcDrawImGui(const RenderCommand& cmd)
                 {
                     commandList->setScissors(RenderRect(int32_t(drawCmd.ClipRect.x), int32_t(drawCmd.ClipRect.y), int32_t(drawCmd.ClipRect.z), int32_t(drawCmd.ClipRect.w)));
                     clipRect = drawCmd.ClipRect;
+                }
+
+                if (!g_capabilities.descriptorIndexing && g_descriptorGeneration.load(std::memory_order_acquire) != imBoundDescriptorGeneration)
+                {
+                    imBoundDescriptorGeneration = g_descriptorGeneration.load(std::memory_order_acquire);
+                    commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+                    commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 1);
                 }
 
                 commandList->drawIndexedInstanced(drawCmd.ElemCount, 1, drawCmd.IdxOffset, drawCmd.VtxOffset, 0);
@@ -3876,6 +3915,7 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                     commandList->setViewports(RenderViewport(0.0f, 0.0f, float(texture->width), float(texture->height), 0.0f, 1.0f));
                     commandList->setScissors(RenderRect(0, 0, texture->width, texture->height));
                     commandList->setGraphicsPushConstants(0, &surface->descriptorIndex, 0, sizeof(uint32_t));
+                    RebindMainDescriptorHeapsIfStale(commandList.get());
                     commandList->drawInstanced(6, 1, 0, 0);
 
                     g_dirtyStates.renderTargetAndDepthStencil = true;
@@ -4751,6 +4791,7 @@ static void ProcSetSamplerState(const RenderCommand& cmd)
             {
                 sampler = g_device->createSampler(samplerDesc);
                 g_samplerDescriptorSet->setSampler(descriptorIndex - 1, sampler.get());
+                BumpDescriptorGeneration();
             }
             else
             {
@@ -4843,6 +4884,7 @@ static void FlushRenderStateForRenderThread()
     FlushViewport();
 
     auto& commandList = g_commandLists[g_frame];
+    RebindMainDescriptorHeapsIfStale(commandList.get());
 
     // D3D12 resets depth bias values to the pipeline values, even if they are dynamic.
     // We can reduce unnecessary calls by making common depth bias values part of the pipeline.
