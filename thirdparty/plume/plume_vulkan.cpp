@@ -1365,7 +1365,10 @@ namespace plume {
             memcpy(rewrittenCode.data(), data, size);
 
             const spirv_fixup::Result fixup = spirv_fixup::rewriteRuntimeDescriptorArrays(rewrittenCode,
-                device->fixedSampledImageArraySize, device->fixedSamplerArraySize, device->sampledImageArrayDynamicIndexing);
+                // Don't declare SampledImageArrayDynamicIndexing: DXC never emits it for fixed arrays,
+                // and the stock Mali-G52 driver fails pipeline creation (-3) when it is present even
+                // though it reports shaderSampledImageArrayDynamicIndexing (confirmed by the self-test).
+                device->fixedSampledImageArraySize, device->fixedSamplerArraySize, false);
 
             if (fixup.error) {
                 fprintf(stderr, "SPIR-V descriptor array rewrite failed to parse the module; using it unmodified.\n");
