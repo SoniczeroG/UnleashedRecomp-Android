@@ -2124,6 +2124,7 @@ namespace plume {
         writeDescriptor.pImageInfo = imageInfo;
         writeDescriptor.pTexelBufferView = texelBufferView;
 
+        const std::scoped_lock updateLock(updateMutex);
         vkUpdateDescriptorSets(device->vk, 1, &writeDescriptor, 0, nullptr);
     }
 
@@ -3661,7 +3662,13 @@ namespace plume {
         assert(setIndex < pipelineLayout->descriptorSetLayouts.size());
 
         const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
-        vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
+        if (interfaceSet->device->fixedDescriptorArrays) {
+            const std::scoped_lock updateLock(interfaceSet->updateMutex);
+            vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
+        }
+        else {
+            vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
+        }
     }
 
     // VulkanCommandFence

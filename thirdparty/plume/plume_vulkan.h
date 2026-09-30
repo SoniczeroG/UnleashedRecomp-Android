@@ -211,6 +211,12 @@ namespace plume {
         VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
         VulkanDevice *device = nullptr;
 
+        // vkUpdateDescriptorSets requires external synchronization of the destination set, and
+        // the renderer writes the shared texture heap from several threads. In the fixed-array
+        // fallback, binds also take this lock so a driver that snapshots the set at bind time
+        // never copies a half-written descriptor.
+        mutable std::mutex updateMutex;
+
         VulkanDescriptorSet(VulkanDevice *device, const RenderDescriptorSetDesc &desc);
         ~VulkanDescriptorSet() override;
         void setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) override;
