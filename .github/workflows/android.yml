@@ -89,7 +89,15 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
         run: |
+          if [ ! -f tools/XenosRecomp/thirdparty/zstd/build/cmake/CMakeLists.txt ]; then
+            git clone --filter=blob:none --no-checkout https://github.com/facebook/zstd "$RUNNER_TEMP/zstd"
+            git -C "$RUNNER_TEMP/zstd" checkout f7a8bb1263448e5028aceeba606a08fe3809550f -- build/cmake
+            mkdir -p tools/XenosRecomp/thirdparty/zstd/build
+            cp -r "$RUNNER_TEMP/zstd/build/cmake" tools/XenosRecomp/thirdparty/zstd/build/
+          fi
           cmake -S . -B out/build/host-tools -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=Release \
             -DUNLEASHED_RECOMP_HOST_TOOLS_ONLY=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
