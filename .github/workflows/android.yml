@@ -177,7 +177,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: UnleashedRecomp-Android-${{ github.ref_name }}
+          name: UnleashedRecomp-Android-${{ github.sha }}
           path: android-apk/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
