@@ -428,14 +428,7 @@ struct TextureDescriptorAllocator
         return value;
     }
 
-    void free(uint32_t value)
-    {
-        if (value < TEXTURE_DESCRIPTOR_NULL_COUNT)
-            return;
-
-        std::lock_guard lock(mutex);
-        freed.push_back(value);
-    }
+    void free(uint32_t value);
 };
 
 static uint32_t GetNullTextureDescriptorIndex(RenderTextureViewDimension dimension)
@@ -456,14 +449,215 @@ static std::unique_ptr<RenderTextureView> g_blankTextureViews[TEXTURE_DESCRIPTOR
 
 static TextureDescriptorAllocator g_textureDescriptorAllocator;
 
+// ---------------------------------------------------------------------------------------------
+// Texture residency for the fixed-size descriptor array fallback (no descriptor indexing).
+//
+// Such devices cap the texture heap at a few hundred slots (256 on Mali-G52), far below the number
+// of textures the game keeps loaded. In that mode descriptor indices handed out by the allocator
+// are *virtual* IDs: textures are only registered here, and are given a real heap slot on demand
+// when a draw actually references them. Slots not referenced for a few frames (so no command
+// buffer still in flight can use them) are recycled, so only the textures used by recent frames
+// need to fit in the heap. All heap writes in this mode go through this class under one mutex.
+// ---------------------------------------------------------------------------------------------
+struct TextureResidency
+{
+    struct Entry
+    {
+        const RenderTexture* texture = nullptr;
+        const RenderTextureView* view = nullptr;
+        RenderTextureLayout layout = RenderTextureLayout::SHADER_READ;
+        uint32_t nullIndex = TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D;
+        uint32_t slot = 0; // 0 = not resident (slot 0 is a reserved blank slot, never assigned)
+        bool registered = false;
+    };
+
+    struct Slot
+    {
+        uint32_t owner = 0; // virtual ID, 0 = free
+        uint64_t lastUsedFrame = 0;
+    };
+
+    // Frames that may still be recording/executing and therefore reference a slot: the one being
+    // recorded and NUM_FRAMES - 1 submitted ones, plus one extra frame of margin.
+    static constexpr uint64_t SLOT_REUSE_DELAY = 3;
+
+    std::mutex mutex;
+    bool enabled = false;
+    std::vector<Entry> entries;
+    std::vector<Slot> slots;
+    uint32_t clockHand = TEXTURE_DESCRIPTOR_NULL_COUNT;
+    uint64_t frame = SLOT_REUSE_DELAY + 1;
+    uint64_t missCount = 0;
+    uint64_t evictionCount = 0;
+
+    void init(uint32_t slotCount)
+    {
+        std::lock_guard lock(mutex);
+        enabled = true;
+        slots.assign(slotCount, Slot{});
+        clockHand = TEXTURE_DESCRIPTOR_NULL_COUNT;
+    }
+
+    Entry& entryFor(uint32_t id)
+    {
+        if (id >= entries.size())
+            entries.resize(std::max<size_t>(id + 1, entries.size() * 2));
+
+        return entries[id];
+    }
+
+    void writeSlot(uint32_t slot, const Entry& entry)
+    {
+        g_textureDescriptorSet->setTexture(slot, entry.texture, entry.layout, entry.view);
+    }
+
+    void writeBlank(uint32_t slot)
+    {
+        g_textureDescriptorSet->setTexture(slot, g_blankTextures[TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D].get(),
+            RenderTextureLayout::SHADER_READ, g_blankTextureViews[TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D].get());
+    }
+
+    void registerTexture(uint32_t id, const RenderTexture* texture, RenderTextureLayout layout, const RenderTextureView* view, uint32_t nullIndex)
+    {
+        std::lock_guard lock(mutex);
+        Entry& entry = entryFor(id);
+        entry.texture = texture;
+        entry.view = view;
+        entry.layout = layout;
+        entry.nullIndex = nullIndex;
+        entry.registered = true;
+
+        // Re-registration (e.g. a resized intermediate target): refresh the resident descriptor.
+        if (entry.slot != 0)
+            writeSlot(entry.slot, entry);
+    }
+
+    void unregisterTexture(uint32_t id)
+    {
+        std::lock_guard lock(mutex);
+        if (id >= entries.size())
+            return;
+
+        Entry& entry = entries[id];
+        if (entry.slot != 0)
+        {
+            // Don't leave a descriptor pointing at a view that is about to be destroyed.
+            writeBlank(entry.slot);
+            slots[entry.slot].owner = 0;
+        }
+
+        entry = Entry{};
+    }
+
+    // Returns the heap slot to put in shader constants for virtual texture ID `id` this frame.
+    uint32_t resolve(uint32_t id)
+    {
+        if (id < TEXTURE_DESCRIPTOR_NULL_COUNT)
+            return id;
+
+        std::lock_guard lock(mutex);
+        if (id >= entries.size() || !entries[id].registered)
+            return TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D;
+
+        Entry& entry = entries[id];
+        if (entry.slot != 0)
+        {
+            slots[entry.slot].lastUsedFrame = frame;
+            return entry.slot;
+        }
+
+        // Clock sweep for a free slot, or one not referenced by any frame that may still be in flight.
+        const uint32_t slotCount = uint32_t(slots.size());
+        const uint32_t usable = slotCount - TEXTURE_DESCRIPTOR_NULL_COUNT;
+        for (uint32_t i = 0; i < usable; i++)
+        {
+            uint32_t slot = clockHand;
+            clockHand = (clockHand + 1 < slotCount) ? clockHand + 1 : TEXTURE_DESCRIPTOR_NULL_COUNT;
+
+            Slot& candidate = slots[slot];
+            if (candidate.owner != 0 && (candidate.lastUsedFrame + SLOT_REUSE_DELAY > frame))
+                continue;
+
+            if (candidate.owner != 0)
+            {
+                entries[candidate.owner].slot = 0;
+                evictionCount++;
+            }
+
+            candidate.owner = id;
+            candidate.lastUsedFrame = frame;
+            entry.slot = slot;
+            writeSlot(slot, entry);
+            return slot;
+        }
+
+        // Every slot is used by recent frames: draw this texture blank rather than stall.
+        if ((missCount++ % 1024) == 0)
+            LOGF_WARNING("Texture heap: all {} slots in use by recent frames; {} texture binding(s) drawn blank so far.", usable, missCount);
+
+        return entry.nullIndex;
+    }
+
+    void beginFrame()
+    {
+        std::lock_guard lock(mutex);
+        frame++;
+
+        if ((frame % 1800) == 0)
+        {
+            uint32_t resident = 0;
+            for (const Slot& slot : slots)
+                resident += (slot.owner != 0) ? 1 : 0;
+
+            LOGF("Texture heap: {} of {} slots resident, {} evictions, {} blank bindings so far.",
+                resident, uint32_t(slots.size()) - TEXTURE_DESCRIPTOR_NULL_COUNT, evictionCount, missCount);
+        }
+    }
+};
+
+static TextureResidency g_textureResidency;
+
+void TextureDescriptorAllocator::free(uint32_t value)
+{
+    if (value < TEXTURE_DESCRIPTOR_NULL_COUNT)
+        return;
+
+    if (g_textureResidency.enabled)
+        g_textureResidency.unregisterTexture(value);
+
+    std::lock_guard lock(mutex);
+    freed.push_back(value);
+}
+
+// Returns the heap slot for a texture descriptor index: identity with descriptor indexing, a
+// resident slot (assigned on demand) in the fixed-size fallback.
+static uint32_t ResolveTextureSlot(uint32_t descriptorIndex)
+{
+    return g_textureResidency.enabled ? g_textureResidency.resolve(descriptorIndex) : descriptorIndex;
+}
+
 // Writes an allocated texture descriptor; reserved blank slots (returned on heap exhaustion) are left untouched.
-static void SetTextureDescriptor(uint32_t descriptorIndex, const RenderTexture* texture, RenderTextureLayout layout, const RenderTextureView* textureView = nullptr)
+// In the fixed-size fallback the texture is only registered; a heap slot is assigned when it is drawn.
+static void SetTextureDescriptor(uint32_t descriptorIndex, const RenderTexture* texture, RenderTextureLayout layout,
+    const RenderTextureView* textureView = nullptr, uint32_t nullIndex = TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D)
 {
     if (descriptorIndex < TEXTURE_DESCRIPTOR_NULL_COUNT)
         return;
 
+    if (g_textureResidency.enabled)
+    {
+        g_textureResidency.registerTexture(descriptorIndex, texture, layout, textureView, nullIndex);
+        return;
+    }
+
     g_textureDescriptorSet->setTexture(descriptorIndex, texture, layout, textureView);
 }
+
+// Virtual texture IDs bound to the 16 fetch slots (fixed-size fallback only); resolved to heap slots
+// into g_sharedConstants right before each draw so they stay valid across frames.
+static uint32_t g_boundTexture2DIds[16];
+static uint32_t g_boundTexture3DIds[16];
+static uint32_t g_boundTextureCubeIds[16];
 
 static std::unique_ptr<RenderPipelineLayout> g_pipelineLayout;
 static xxHashMap<std::unique_ptr<RenderPipeline>> g_pipelines;
@@ -1756,7 +1950,13 @@ static void BeginCommandList()
         g_sharedConstants.texture2DIndices[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D;
         g_sharedConstants.texture3DIndices[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D;
         g_sharedConstants.textureCubeIndices[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE;
+        g_boundTexture2DIds[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D;
+        g_boundTexture3DIds[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D;
+        g_boundTextureCubeIds[i] = TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE;
     }
+
+    if (g_textureResidency.enabled)
+        g_textureResidency.beginFrame();
 
     memset(g_textures, 0, sizeof(g_textures));
 
@@ -2049,7 +2249,15 @@ bool Video::CreateHostDevice(const char *sdlVideoDriver, bool graphicsApiRetry)
     if (g_capabilities.maxSamplerDescriptors != 0)
         g_samplerDescriptorSize = uint32_t(std::min<size_t>(SAMPLER_DESCRIPTOR_SIZE, g_capabilities.maxSamplerDescriptors));
 
-    g_textureDescriptorAllocator.limit = g_textureDescriptorSize;
+    if (g_capabilities.descriptorIndexing)
+    {
+        g_textureDescriptorAllocator.limit = g_textureDescriptorSize;
+    }
+    else
+    {
+        // Fixed-size fallback: allocator indices are virtual IDs, mapped to heap slots on demand.
+        g_textureResidency.init(g_textureDescriptorSize);
+    }
 
     if (!g_capabilities.descriptorIndexing)
     {
@@ -3050,7 +3258,7 @@ static void ProcDrawImGui(const RenderCommand& cmd)
                         texture->layout = RenderTextureLayout::SHADER_READ;
                     }
 
-                    descriptorIndex = texture->descriptorIndex;
+                    descriptorIndex = ResolveTextureSlot(texture->descriptorIndex);
 
                     if (texture == g_imFontTexture.get())
                         descriptorIndex |= 0x80000000;
@@ -3264,7 +3472,7 @@ static void ProcExecuteCommandList(const RenderCommand& cmd)
             constants.gammaR = 1.0f / std::clamp(constants.gammaR + offset, 0.1f, 4.0f);
             constants.gammaG = 1.0f / std::clamp(constants.gammaG + offset, 0.1f, 4.0f);
             constants.gammaB = 1.0f / std::clamp(constants.gammaB + offset, 0.1f, 4.0f);
-            constants.textureDescriptorIndex = g_intermediaryBackBufferTextureDescriptorIndex;
+            constants.textureDescriptorIndex = ResolveTextureSlot(g_intermediaryBackBufferTextureDescriptorIndex);
 
             constants.viewportOffsetX = (int32_t(g_swapChain->getWidth()) - int32_t(Video::s_viewportWidth)) / 2;
             constants.viewportOffsetY = (int32_t(g_swapChain->getHeight()) - int32_t(Video::s_viewportHeight)) / 2;
@@ -3486,7 +3694,7 @@ static GuestTexture* CreateTexture(uint32_t width, uint32_t height, uint32_t dep
     texture->viewDimension = viewDesc.dimension;
     texture->descriptorIndex = g_textureDescriptorAllocator.allocate(GetNullTextureDescriptorIndex(viewDesc.dimension));
 
-    SetTextureDescriptor(texture->descriptorIndex, texture->texture, RenderTextureLayout::SHADER_READ, texture->textureView.get());
+    SetTextureDescriptor(texture->descriptorIndex, texture->texture, RenderTextureLayout::SHADER_READ, texture->textureView.get(), GetNullTextureDescriptorIndex(viewDesc.dimension));
    
 #ifdef _DEBUG 
     texture->texture->setName(fmt::format("Texture {:X}", g_memory.MapVirtual(texture)));
@@ -3875,7 +4083,8 @@ static void ExecutePendingStretchRectCommands(GuestSurface* renderTarget, GuestS
                     commandList->setPipeline(pipeline);
                     commandList->setViewports(RenderViewport(0.0f, 0.0f, float(texture->width), float(texture->height), 0.0f, 1.0f));
                     commandList->setScissors(RenderRect(0, 0, texture->width, texture->height));
-                    commandList->setGraphicsPushConstants(0, &surface->descriptorIndex, 0, sizeof(uint32_t));
+                    uint32_t surfaceSlot = ResolveTextureSlot(surface->descriptorIndex);
+                    commandList->setGraphicsPushConstants(0, &surfaceSlot, 0, sizeof(uint32_t));
                     commandList->drawInstanced(6, 1, 0, 0);
 
                     g_dirtyStates.renderTargetAndDepthStencil = true;
@@ -4114,16 +4323,36 @@ static void SetTexture(GuestDevice* device, uint32_t index, GuestTexture* textur
     g_renderQueue.enqueue(cmd);
 }
 
+// With descriptor indexing the index goes straight into the shared constants; in the fixed-size
+// fallback the virtual ID is remembered and resolved to a heap slot right before each draw.
+static void SetBoundTextureIndex(uint32_t (&constants)[16], uint32_t (&boundIds)[16], uint32_t index, uint32_t descriptorIndex)
+{
+    if (g_textureResidency.enabled)
+        boundIds[index] = descriptorIndex;
+    else
+        SetDirtyValue(g_dirtyStates.sharedConstants, constants[index], descriptorIndex);
+}
+
+static void ResolveBoundTextureSlots()
+{
+    for (size_t i = 0; i < 16; i++)
+    {
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[i], ResolveTextureSlot(g_boundTexture2DIds[i]));
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture3DIndices[i], ResolveTextureSlot(g_boundTexture3DIds[i]));
+        SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.textureCubeIndices[i], ResolveTextureSlot(g_boundTextureCubeIds[i]));
+    }
+}
+
 static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
 {
     AddBarrier(texture, RenderTextureLayout::SHADER_READ);
 
     auto viewDimension = texture != nullptr ? texture->viewDimension : RenderTextureViewDimension::UNKNOWN;
 
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[index],
+    SetBoundTextureIndex(g_sharedConstants.texture2DIndices, g_boundTexture2DIds, index,
         viewDimension == RenderTextureViewDimension::TEXTURE_2D ? texture->descriptorIndex : TEXTURE_DESCRIPTOR_NULL_TEXTURE_2D);
 
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture3DIndices[index], texture != nullptr &&
+    SetBoundTextureIndex(g_sharedConstants.texture3DIndices, g_boundTexture3DIds, index, texture != nullptr &&
         viewDimension == RenderTextureViewDimension::TEXTURE_3D ? texture->descriptorIndex : TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D);
 
     // Check if there's a cubemap texture we recreated and assign it if it's valid. The shader will pick whichever is correct.
@@ -4134,7 +4363,7 @@ static void SetTextureInRenderThread(uint32_t index, GuestTexture* texture)
         viewDimension = texture->viewDimension;
     }
 
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.textureCubeIndices[index], texture != nullptr &&
+    SetBoundTextureIndex(g_sharedConstants.textureCubeIndices, g_boundTextureCubeIds, index, texture != nullptr &&
         viewDimension == RenderTextureViewDimension::TEXTURE_CUBE ? texture->descriptorIndex : TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE);
 }
 
@@ -4142,9 +4371,9 @@ static void SetSurface(uint32_t index, GuestSurface* surface)
 {
     AddBarrier(surface, RenderTextureLayout::SHADER_READ);
 
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture2DIndices[index], surface->descriptorIndex);
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.texture3DIndices[index], uint32_t(TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D));
-    SetDirtyValue(g_dirtyStates.sharedConstants, g_sharedConstants.textureCubeIndices[index], uint32_t(TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE));
+    SetBoundTextureIndex(g_sharedConstants.texture2DIndices, g_boundTexture2DIds, index, surface->descriptorIndex);
+    SetBoundTextureIndex(g_sharedConstants.texture3DIndices, g_boundTexture3DIds, index, uint32_t(TEXTURE_DESCRIPTOR_NULL_TEXTURE_3D));
+    SetBoundTextureIndex(g_sharedConstants.textureCubeIndices, g_boundTextureCubeIds, index, uint32_t(TEXTURE_DESCRIPTOR_NULL_TEXTURE_CUBE));
 }
 
 static void ProcSetTexture(const RenderCommand& cmd)
@@ -4880,6 +5109,9 @@ static void FlushRenderStateForRenderThread()
         auto pixelShaderConstants = g_uploadAllocators[g_frame].allocate<true>(g_pixelShaderConstants, sizeof(g_pixelShaderConstants), 0x100);
         SetRootDescriptor(pixelShaderConstants, 1);
     }
+
+    if (g_textureResidency.enabled)
+        ResolveBoundTextureSlots();
 
     if (g_dirtyStates.sharedConstants)
     {
@@ -6285,7 +6517,7 @@ static bool LoadTexture(GuestTexture& texture, const uint8_t* data, size_t dataS
 
         texture.textureView = texture.texture->createTextureView(viewDesc);
         texture.descriptorIndex = g_textureDescriptorAllocator.allocate(GetNullTextureDescriptorIndex(viewDesc.dimension));
-        SetTextureDescriptor(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ, texture.textureView.get());
+        SetTextureDescriptor(texture.descriptorIndex, texture.texture, RenderTextureLayout::SHADER_READ, texture.textureView.get(), GetNullTextureDescriptorIndex(viewDesc.dimension));
 
         texture.width = desc.width;
         texture.height = desc.height;
