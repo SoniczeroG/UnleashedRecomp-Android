@@ -3,6 +3,7 @@
 #include <xxh3.h>
 
 #include "directory_file_system.h"
+#include "directory_transaction.h"
 #include "iso_file_system.h"
 #include "xcontent_file_system.h"
 
@@ -665,6 +666,62 @@ void Installer::rollback(Journal &journal)
     {
         std::filesystem::remove(*it, ec);
     }
+}
+
+bool Installer::recoverDLCInstall(const std::filesystem::path &root, std::string &error)
+{
+    for (int type = int(DLC::Spagonia); type <= int(DLC::EmpireCityAdabat); type++)
+    {
+        DLCSource source;
+        if (!fillDLCSource(DLC(type), source)) continue;
+        const auto target = root / source.targetSubDirectory;
+        const auto backup = target.parent_path() / ("." + target.filename().string() + ".previous");
+        if (!DirectoryTransaction::recover(target, backup, error)) return false;
+    }
+    return true;
+}
+
+bool Installer::installDLC(const Sources &sources, const std::filesystem::path &root, Journal &journal)
+{
+    if (sources.game || sources.update || sources.dlc.empty())
+    {
+        journal.lastErrorMessage = "Select DLC packages only for an existing installation.";
+        return false;
+    }
+    if (!recoverDLCInstall(root, journal.lastErrorMessage)) return false;
+    const auto temporary = root / ".dlc-install";
+    std::error_code ec;
+    std::filesystem::remove_all(temporary, ec);
+    if (ec)
+    {
+        journal.lastErrorMessage = "Cannot clear the temporary DLC installation: " + ec.message();
+        return false;
+    }
+    // Hash-check every pack in a separate tree before replacing any installed pack.
+    const bool copied = install(sources, temporary, false, journal, std::chrono::seconds(0), [] { return true; });
+    bool committed = copied;
+    if (copied)
+    {
+        std::filesystem::create_directories(root / DLCDirectory, ec);
+        if (ec)
+        {
+            journal.lastErrorMessage = "Cannot create the DLC directory: " + ec.message();
+            committed = false;
+        }
+        for (const auto &source : sources.dlc)
+        {
+            if (!committed) break;
+            const auto target = root / source.targetSubDirectory;
+            const auto backup = target.parent_path() / ("." + target.filename().string() + ".previous");
+            committed = DirectoryTransaction::replace(temporary / source.targetSubDirectory,
+                target, backup, journal.lastErrorMessage);
+        }
+    }
+    std::filesystem::remove_all(temporary, ec);
+    // Never roll back paths of packs already committed in this batch.
+    journal.createdFiles.clear();
+    journal.createdDirectories.clear();
+    return committed;
 }
 
 bool Installer::parseGame(const std::filesystem::path &sourcePath)

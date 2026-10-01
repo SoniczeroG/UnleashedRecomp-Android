@@ -17,7 +17,8 @@ This is an unofficial Android port of [Unleashed Recompiled](https://github.com/
 - The full game, including title screens and regular gameplay
 - ARM64 Android devices
 - Installing the game and mods from a `.zip` or folder directly in the app — no PC needed
-- Staging Xbox 360 base-game, title-update and DLC package files for verified installation on first launch
+- Staging Xbox 360 base-game, title-update and DLC package files for verified installation, including adding DLC to an installed game
+- Choosing game storage on internal memory or a mounted SD card, with optional verified copying of game files, mods, settings and saves
 - On-screen touch controls with multi-touch, touch camera control, and a drag-to-arrange layout editor; the layout adapts to the game (D-pad in menus, a SKIP button in cutscenes)
 - Bluetooth and USB controllers
 - Sound through speakers, wired headphones, and Bluetooth devices
@@ -39,7 +40,7 @@ PowerVR and Samsung Xclipse are untested. On Xclipse devices the system driver i
 You need:
 
 - A 64-bit Android device
-- Android 9 or newer
+- Android 10 or newer
 - A supported Qualcomm Adreno GPU (or a recent Mali GPU — experimental)
 - Several gigabytes of free storage
 - Your own Xbox 360 game dump
@@ -55,6 +56,10 @@ For the smoothest first run, start with the default graphics settings. The Andro
 5. Tap **Launch game**.
 
 A raw dump (`game` + `update`, with optional `dlc`) is enough: if the `patched` folder produced by the desktop installer is missing, the app builds the patched executable itself on first launch. No PC is required at any point.
+
+To add DLC later, use the same installer with DLC packages or a DLC-only ZIP/folder, then launch the game to verify and install the packs. You do not need to import the base game again.
+
+The launcher's storage selector lists app folders on available volumes, including mounted SD cards. You can copy your existing installation to the selected location; the copy is verified and the original files are kept. Fully close and reopen the app before changing storage after a game session. A selected SD card must remain available when launching the game.
 
 <details>
 <summary>Manual installation (alternative)</summary>
@@ -211,6 +216,8 @@ This port exists because many people shared code, testing time, traces, hardware
 - [SansNope](https://github.com/SansNope) — Android port stewardship, builds, Turnip integration, and the public home of this fork
 - [ITSeniy](https://github.com/ITSeniy) — lifecycle and audio stabilization, Vulkan recovery, touch controls, Android file access, driver management, and the in-app mod workflow
 - [GdGohan](https://github.com/GdGohan) — ModLoader compatibility work and Android build contributions
+- [puopg (Michael Chen)](https://github.com/puopg) — the guest-memory `memmove` fix for ring crashes and collision triggers, removal of earlier workarounds, and fresh-clone build fixes
+- [vladector](https://github.com/vladector) — landscape rendering in the display-cutout area
 - [renderbag/plume](https://github.com/renderbag/plume) — the Vulkan renderer used by Unleashed Recompiled
 - Mesa's Freedreno/Turnip developers — the open-source Vulkan driver that makes the port practical on Adreno hardware
 - [bylaws/libadrenotools](https://github.com/bylaws/libadrenotools) and the Android driver community — runtime custom-driver loading

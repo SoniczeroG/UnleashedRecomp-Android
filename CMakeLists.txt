@@ -60,6 +60,7 @@ endif()
 
 if (UNLEASHED_RECOMP_HOST_TOOLS_ONLY)
     add_subdirectory(${UNLEASHED_RECOMP_TOOLS_ROOT})
+    target_compile_definitions(XenosRecomp PRIVATE UNLEASHED_RECOMP)
 else()
     add_subdirectory(${UNLEASHED_RECOMP_THIRDPARTY_ROOT})
 

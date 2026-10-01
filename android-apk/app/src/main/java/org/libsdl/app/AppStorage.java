@@ -1,8 +1,14 @@
 package org.libsdl.app;
 
 import android.content.Context;
+import android.os.Environment;
+import android.os.storage.StorageManager;
+import android.os.storage.StorageVolume;
 
 import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Paths shared by the launcher, document provider and native Android storage policy. */
 final class AppStorage {
@@ -18,8 +24,14 @@ final class AppStorage {
         return (dirs != null && dirs.length > 0) ? dirs[0] : null;
     }
 
-    /** Mirrors the native GetDataRoot(): internal → Android/data → Android/media, populated wins. */
+    /** Native GetDataRoot queries this method through SDLActivity's JNI bridge. */
     static File activeGameRoot(Context context) {
+        String selected = context.getSharedPreferences("game_storage", Context.MODE_PRIVATE)
+            .getString("root", "");
+        return selected.isEmpty() ? automaticGameRoot(context) : new File(selected);
+    }
+
+    private static File automaticGameRoot(Context context) {
         File internal = new File(context.getFilesDir(), "UnleashedRecomp");
         if (new File(internal, "game").isDirectory()) {
             return internal;
@@ -40,6 +52,65 @@ final class AppStorage {
         }
 
         return external != null ? external : internal;
+    }
+
+    static final class Choice {
+        final String label;
+        final File root; // null means the legacy automatic policy
+        Choice(String label, File root) { this.label = label; this.root = root; }
+    }
+
+    static List<Choice> storageChoices(Context context) {
+        List<Choice> choices = new ArrayList<>();
+        choices.add(new Choice(context.getString(R.string.storage_auto), null));
+        choices.add(new Choice(context.getString(R.string.storage_internal),
+            new File(context.getFilesDir(), "UnleashedRecomp")));
+        addChoices(context, choices, context.getExternalFilesDirs(null), false);
+        addChoices(context, choices, context.getExternalMediaDirs(), true);
+        return choices;
+    }
+
+    private static void addChoices(Context context, List<Choice> choices, File[] bases, boolean media) {
+        if (bases == null) return;
+        StorageManager manager = context.getSystemService(StorageManager.class);
+        for (File base : bases) {
+            if (base == null || !Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState(base))) continue;
+            File root = new File(base, "UnleashedRecomp");
+            StorageVolume volume = manager != null ? manager.getStorageVolume(base) : null;
+            String volumeName = volume != null ? volume.getDescription(context) : base.getPath();
+            String label = context.getString(media ? R.string.storage_media : R.string.storage_app, volumeName);
+            choices.add(new Choice(label, root));
+        }
+    }
+
+    static File choiceRoot(Context context, Choice choice) {
+        return choice.root != null ? choice.root : automaticGameRoot(context);
+    }
+
+    static void validateRoot(Context context, File root) throws IOException {
+        File internal = new File(context.getFilesDir(), "UnleashedRecomp");
+        if (!root.getCanonicalFile().equals(internal.getCanonicalFile())) {
+            try {
+                if (!Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState(root))) {
+                    throw new IOException(context.getString(R.string.storage_unavailable, root));
+                }
+            } catch (IllegalArgumentException exception) {
+                throw new IOException(context.getString(R.string.storage_unavailable, root), exception);
+            }
+        }
+        if (!root.isDirectory() && !root.mkdirs()) throw new IOException(context.getString(R.string.error_storage_create, root));
+        File probe = File.createTempFile("write-probe-", ".tmp", root);
+        if (!probe.delete()) throw new IOException(context.getString(R.string.error_storage_write, root));
+    }
+
+    static void selectStorage(Context context, Choice choice) throws IOException {
+        validateRoot(context, choiceRoot(context, choice));
+        android.content.SharedPreferences.Editor edit = context.getSharedPreferences("game_storage", Context.MODE_PRIVATE).edit();
+        if (choice.root == null) edit.remove("root");
+        else edit.putString("root", choice.root.getCanonicalPath());
+        if (!edit.commit()) throw new LocalizedIOException("error_storage_selection", null);
+        context.getContentResolver().notifyChange(android.provider.DocumentsContract.buildRootsUri(
+            context.getPackageName() + ".documents"), null);
     }
 
     static File configFile(Context context) {

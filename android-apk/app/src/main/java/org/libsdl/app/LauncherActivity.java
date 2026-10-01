@@ -75,6 +75,8 @@ public final class LauncherActivity extends Activity {
     private CheckBox forceBc;
     private SharedPreferences prefs;
     private InstallState lastInstallState;
+    private TextView storageStatus;
+    private boolean fileOperation;
 
     private static final class InstallState {
         final boolean ready;
@@ -123,6 +125,9 @@ public final class LauncherActivity extends Activity {
         fileButtons.addView(button(R.string.launcher_recheck, view -> refreshStatuses()), weighted());
         files.addView(fileButtons);
         files.addView(button(R.string.launcher_open_saves, view -> openFiles("save")));
+        storageStatus = statusText();
+        files.addView(storageStatus);
+        files.addView(button(R.string.storage_choose, view -> chooseStorage()));
         page.addView(files);
 
         LinearLayout updates = card(R.string.launcher_updates);
@@ -195,9 +200,11 @@ public final class LauncherActivity extends Activity {
     }
 
     private void refreshStatuses() {
+        File currentRoot = AppStorage.activeGameRoot(this);
+        storageStatus.setText(getString(R.string.storage_current, currentRoot));
         lastInstallState = inspectInstallation();
         boolean stagedInstall = hasStagedGamePackages();
-        installStatus.setText(stagedInstall && !lastInstallState.ready
+        installStatus.setText(stagedInstall
             ? getString(R.string.launcher_install_staged)
             : lastInstallState.message);
         installStatus.setTextColor(lastInstallState.ready ? Color.rgb(25, 120, 55)
@@ -233,6 +240,11 @@ public final class LauncherActivity extends Activity {
 
     private InstallState inspectInstallation() {
         File root = AppStorage.activeGameRoot(this);
+        try {
+            AppStorage.validateRoot(this, root);
+        } catch (IOException exception) {
+            return new InstallState(false, FileErrorMessages.describe(this, exception));
+        }
         if (!root.exists() && !root.mkdirs()) {
             return new InstallState(false, getString(R.string.error_storage_create, root));
         }
@@ -299,6 +311,7 @@ public final class LauncherActivity extends Activity {
         values.put("Video.RenderMode", quote(RENDER_MODE_VALUES[renderSpinner.getSelectedItemPosition()]));
         values.put("Codes.SkipIntroLogos", Boolean.toString(skipIntro.isChecked()));
         try {
+            AppStorage.validateRoot(this, AppStorage.activeGameRoot(this));
             patchConfig(AppStorage.configFile(this), values);
             setMarker(new File(getFilesDir(), "turnip/vk_layer_settings.txt"), validation.isChecked(),
                 "khronos_validation.enables = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT\n");
@@ -306,12 +319,13 @@ public final class LauncherActivity extends Activity {
             setMarker(new File(getFilesDir(), "force_bc.txt"), forceBc.isChecked(), "");
             return true;
         } catch (IOException exception) {
-            showError(getString(R.string.error_settings_save, exception.getMessage()));
+            showError(getString(R.string.error_settings_save, FileErrorMessages.describe(this, exception)));
             return false;
         }
     }
 
     private void launchGame(boolean editControls) {
+        if (fileOperation) { showError(getString(R.string.storage_busy)); return; }
         if (!saveSettings()) return;
         InstallState current = inspectInstallation();
         if (!current.ready && !hasStagedGamePackages()) {
@@ -319,11 +333,12 @@ public final class LauncherActivity extends Activity {
             refreshStatuses();
             return;
         }
+        if (prepareStagedArchives(editControls)) return;
         if (editControls) {
             try {
                 setMarker(new File(AppStorage.activeGameRoot(this), "touch_layout_edit.txt"), true, "1\n");
             } catch (IOException exception) {
-                showError(getString(R.string.error_layout_editor, exception.getMessage()));
+                showError(getString(R.string.error_layout_editor, FileErrorMessages.describe(this, exception)));
                 return;
             }
         }
@@ -339,6 +354,45 @@ public final class LauncherActivity extends Activity {
             return;
         }
         launchGame(true);
+    }
+
+    /** Recover ZIPs left in to_install by versions that only copied the archive. */
+    private boolean prepareStagedArchives(boolean editControls) {
+        File staging = new File(AppStorage.activeGameRoot(this), "to_install");
+        File[] archives = staging.listFiles(file -> file.isFile() && file.getName().toLowerCase(Locale.ROOT).endsWith(".zip"));
+        if (archives == null || archives.length == 0) return false;
+        fileOperation = true;
+        InstallProgress progress = new InstallProgress();
+        progress.label = text(getString(R.string.install_scanning), 15, false);
+        progress.label.setPadding(dp(20), dp(16), dp(20), dp(16));
+        progress.dialog = new AlertDialog.Builder(this).setTitle(R.string.install_progress_title)
+            .setView(progress.label).setCancelable(false)
+            .setNegativeButton(R.string.install_cancel, (dialog, which) -> progress.cancelled = true).show();
+        new Thread(() -> {
+            try {
+                for (File archive : archives) {
+                    File batch = new File(staging, "import-" + java.util.UUID.randomUUID());
+                    File temporary = new File(batch.getPath() + ".part");
+                    try {
+                        try (InputStream input = new FileInputStream(archive)) {
+                            progress.files += InstallerArchive.extract(input, temporary, () -> progress.cancelled,
+                                bytes -> progress.bytes += bytes);
+                        }
+                        Files.move(temporary.toPath(), batch.toPath());
+                        try { Files.delete(archive.toPath()); }
+                        catch (IOException exception) { deleteImportBatch(batch); throw exception; }
+                    } finally { deleteImportBatch(temporary); }
+                }
+                runOnUiThread(() -> {
+                    fileOperation = false;
+                    progress.dialog.dismiss();
+                    launchGame(editControls);
+                });
+            } catch (Exception exception) {
+                finishInstall(progress, getString(R.string.error_install_failed, FileErrorMessages.describe(this, exception)), false);
+            }
+        }, "staged-zip-recovery").start();
+        return true;
     }
 
     private void chooseDriver() {
@@ -390,7 +444,7 @@ public final class LauncherActivity extends Activity {
         File target = uniqueFile(directory, safeName(name));
         try (InputStream input = getContentResolver().openInputStream(uri);
              FileOutputStream output = new FileOutputStream(target)) {
-            if (input == null) throw new IOException("Cannot open selected document");
+            if (input == null) throw new LocalizedIOException("error_io_read", uri);
             byte[] buffer = new byte[64 * 1024];
             int count;
             long total = 0;
@@ -398,13 +452,13 @@ public final class LauncherActivity extends Activity {
                 output.write(buffer, 0, count);
                 total += count;
             }
-            if (total == 0) throw new IOException("Selected file is empty");
+            if (total == 0) throw new LocalizedIOException("error_file_empty", null);
             driverSpinner.setSelection(DRIVER_IMPORTED);
             Toast.makeText(this, getString(R.string.driver_imported, target.getName()), Toast.LENGTH_LONG).show();
             refreshStatuses();
         } catch (IOException exception) {
             target.delete();
-            showError(getString(R.string.error_driver_copy, exception.getMessage()));
+            showError(getString(R.string.error_driver_copy, FileErrorMessages.describe(this, exception)));
         }
     }
 
@@ -414,6 +468,10 @@ public final class LauncherActivity extends Activity {
     // ------------------------------------------------------------------
 
     private void chooseInstallSource(boolean gameFiles) {
+        if (fileOperation || SDLActivity.isGameStorageLocked()) {
+            showError(getString(R.string.storage_restart));
+            return;
+        }
         String[] items = gameFiles
             ? new String[] { getString(R.string.install_source_zip), getString(R.string.install_source_folder),
                 getString(R.string.install_source_iso_packages) }
@@ -500,7 +558,8 @@ public final class LauncherActivity extends Activity {
 
     private boolean hasStagedGamePackages() {
         File staging = new File(AppStorage.activeGameRoot(this), "to_install");
-        File[] files = staging.listFiles(file -> file.isFile() && !file.getName().endsWith(".part"));
+        File[] files = staging.listFiles(file -> !file.getName().endsWith(".part") &&
+            (file.isFile() || (file.isDirectory() && file.list() != null && file.list().length > 0)));
         return files != null && files.length > 0;
     }
 
@@ -516,6 +575,7 @@ public final class LauncherActivity extends Activity {
             sources.add(data.getData());
         }
         if (sources.isEmpty()) return;
+        fileOperation = true;
 
         InstallProgress progress = new InstallProgress();
         progress.label = text(getString(R.string.install_scanning), 15, false);
@@ -531,12 +591,30 @@ public final class LauncherActivity extends Activity {
             try {
                 File staging = new File(AppStorage.activeGameRoot(this), "to_install");
                 if (!staging.isDirectory() && !staging.mkdirs()) {
-                    throw new IOException("Cannot create " + staging);
+                    throw new LocalizedIOException("error_io_create", staging);
                 }
                 for (Uri source : sources) {
                     if (progress.cancelled) break;
                     String name = safeName(queryDisplayName(source));
                     if (name.isEmpty()) name = "source.bin";
+                    if (name.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+                        File batch = new File(staging, "import-" + java.util.UUID.randomUUID());
+                        File temporaryBatch = new File(batch.getPath() + ".part");
+                        try {
+                            try (InputStream input = openSourceStream(source)) {
+                                progress.files += InstallerArchive.extract(input, temporaryBatch,
+                                    () -> progress.cancelled, bytes -> {
+                                        long previous = progress.bytes;
+                                        progress.bytes += bytes;
+                                        if (previous / (16 * 1024 * 1024) != progress.bytes / (16 * 1024 * 1024)) publishProgress(progress);
+                                    });
+                            }
+                            if (!progress.cancelled) Files.move(temporaryBatch.toPath(), batch.toPath());
+                        } finally {
+                            deleteImportBatch(temporaryBatch);
+                        }
+                        continue;
+                    }
                     File destination = uniqueFile(staging, name);
                     File temporary = new File(destination.getPath() + ".part");
                     try {
@@ -557,8 +635,7 @@ public final class LauncherActivity extends Activity {
                     ? getString(R.string.install_cancelled)
                     : getString(R.string.install_done_iso_staged), !progress.cancelled);
             } catch (Exception exception) {
-                String reason = exception.getMessage() != null
-                    ? exception.getMessage() : exception.getClass().getSimpleName();
+                String reason = FileErrorMessages.describe(this, exception);
                 finishInstall(progress, getString(R.string.error_install_failed, reason), false);
             }
         }, "iso-stager").start();
@@ -583,6 +660,7 @@ public final class LauncherActivity extends Activity {
     }
 
     private void startInstall(Uri source, boolean isZip, boolean gameFiles) {
+        fileOperation = true;
         InstallProgress progress = new InstallProgress();
         progress.label = text(getString(R.string.install_scanning), 15, false);
         progress.label.setPadding(dp(20), dp(16), dp(20), dp(16));
@@ -595,11 +673,19 @@ public final class LauncherActivity extends Activity {
 
         String fallbackModName = safeName(stripZipExtension(queryDisplayName(source)));
         new Thread(() -> {
+            File temporaryBatch = null;
             try {
                 List<SourceEntry> entries = isZip ? listZipEntries(source) : listTreeEntries(source);
                 Map<SourceEntry, File> plan = gameFiles
                     ? planGameInstall(entries)
                     : planModInstall(entries, fallbackModName);
+                File stagedBatch = null;
+                if (gameFiles && plan.isEmpty()) {
+                    stagedBatch = new File(new File(AppStorage.activeGameRoot(this), "to_install"),
+                        "import-" + java.util.UUID.randomUUID());
+                    temporaryBatch = new File(stagedBatch.getPath() + ".part");
+                    plan = planStagedInstall(entries, temporaryBatch);
+                }
                 int modCount = gameFiles ? 0 : countPlannedMods(plan);
 
                 if (plan.isEmpty()) {
@@ -617,20 +703,23 @@ public final class LauncherActivity extends Activity {
                 if (progress.cancelled) {
                     finishInstall(progress, getString(R.string.install_cancelled), false);
                 } else {
+                    if (stagedBatch != null) Files.move(temporaryBatch.toPath(), stagedBatch.toPath());
                     finishInstall(progress, gameFiles
-                        ? getString(R.string.install_done_game)
+                        ? getString(stagedBatch != null ? R.string.install_done_iso_staged : R.string.install_done_game)
                         : getString(R.string.install_done_mod, modCount), true);
                 }
             } catch (Exception exception) {
-                String reason = exception.getMessage() != null
-                    ? exception.getMessage() : exception.getClass().getSimpleName();
+                String reason = FileErrorMessages.describe(this, exception);
                 finishInstall(progress, getString(R.string.error_install_failed, reason), false);
+            } finally {
+                if (temporaryBatch != null) deleteImportBatch(temporaryBatch);
             }
         }, "installer").start();
     }
 
     private void finishInstall(InstallProgress progress, String message, boolean success) {
         runOnUiThread(() -> {
+            fileOperation = false;
             progress.dialog.dismiss();
             new AlertDialog.Builder(this)
                 .setTitle(success ? R.string.install_progress_title : R.string.error_title)
@@ -644,6 +733,93 @@ public final class LauncherActivity extends Activity {
     private void publishProgress(InstallProgress progress) {
         String status = getString(R.string.install_progress_status, progress.files, formatBytes(progress.bytes));
         runOnUiThread(() -> progress.label.setText(status));
+    }
+
+    private void chooseStorage() {
+        if (fileOperation) { showError(getString(R.string.storage_busy)); return; }
+        if (SDLActivity.isGameStorageLocked()) { showError(getString(R.string.storage_restart)); return; }
+        List<AppStorage.Choice> choices = AppStorage.storageChoices(this);
+        String[] labels = new String[choices.size()];
+        for (int index = 0; index < choices.size(); index++) {
+            AppStorage.Choice choice = choices.get(index);
+            labels[index] = choice.label + "\n" + AppStorage.choiceRoot(this, choice);
+        }
+        new AlertDialog.Builder(this).setTitle(R.string.storage_choose)
+            .setItems(labels, (dialog, index) -> confirmStorage(choices.get(index)))
+            .setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void confirmStorage(AppStorage.Choice choice) {
+        File oldRoot = AppStorage.activeGameRoot(this);
+        File newRoot = AppStorage.choiceRoot(this, choice);
+        try {
+            AppStorage.validateRoot(this, newRoot);
+            if (oldRoot.getCanonicalFile().equals(newRoot.getCanonicalFile())) {
+                useStorage(choice);
+                return;
+            }
+        } catch (IOException exception) { showError(FileErrorMessages.describe(this, exception)); return; }
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
+            .setTitle(choice.label)
+            .setMessage(getString(R.string.storage_confirm, newRoot))
+            .setNegativeButton(android.R.string.cancel, null)
+            .setPositiveButton(R.string.storage_use, (unused, which) -> useStorage(choice));
+        File[] files = newRoot.listFiles();
+        if (oldRoot.isDirectory() && files != null && files.length == 0) {
+            dialog.setNeutralButton(R.string.storage_copy, (unused, which) -> copyStorage(oldRoot, newRoot, choice));
+        }
+        dialog.show();
+    }
+
+    private void useStorage(AppStorage.Choice choice) {
+        try {
+            AppStorage.selectStorage(this, choice);
+            loadSettings();
+            refreshStatuses();
+        } catch (IOException exception) { showError(FileErrorMessages.describe(this, exception)); }
+    }
+
+    private void copyStorage(File oldRoot, File newRoot, AppStorage.Choice choice) {
+        if (!saveSettings()) return;
+        fileOperation = true;
+        InstallProgress progress = new InstallProgress();
+        progress.label = text(getString(R.string.storage_copying), 15, false);
+        progress.label.setPadding(dp(20), dp(16), dp(20), dp(16));
+        progress.dialog = new AlertDialog.Builder(this).setTitle(R.string.storage_copy)
+            .setView(progress.label).setCancelable(false)
+            .setNegativeButton(R.string.install_cancel, (dialog, which) -> progress.cancelled = true).show();
+        new Thread(() -> {
+            String error = null;
+            try {
+                StorageMigration.copy(oldRoot, newRoot, new StorageMigration.Progress() {
+                    long lastUpdate;
+                    public boolean cancelled() { return progress.cancelled; }
+                    public void copied(long bytes) {
+                        progress.bytes += bytes;
+                        if (progress.bytes - lastUpdate >= 16 * 1024 * 1024) {
+                            lastUpdate = progress.bytes;
+                            runOnUiThread(() -> progress.label.setText(getString(R.string.storage_copy_progress,
+                                formatBytes(progress.bytes))));
+                        }
+                    }
+                });
+                AppStorage.selectStorage(this, choice);
+            } catch (Exception exception) {
+                error = FileErrorMessages.describe(this, exception);
+            }
+            String result = error;
+            runOnUiThread(() -> {
+                fileOperation = false;
+                progress.dialog.dismiss();
+                if (result != null) showError(getString(R.string.error_install_failed, result));
+                else {
+                    loadSettings();
+                    new AlertDialog.Builder(this).setMessage(R.string.storage_copied)
+                        .setPositiveButton(android.R.string.ok, null).show();
+                }
+                refreshStatuses();
+            });
+        }, "storage-copy").start();
     }
 
     /** Normalizes a zip/tree relative path; returns null when it must be skipped. */
@@ -725,6 +901,19 @@ public final class LauncherActivity extends Activity {
         return plan;
     }
 
+    /** Stage DLC-only dumps and package archives without requiring a base game. */
+    private static Map<SourceEntry, File> planStagedInstall(List<SourceEntry> entries, File batch) {
+        Map<SourceEntry, File> plan = new LinkedHashMap<>();
+        for (SourceEntry entry : entries) plan.put(entry, new File(batch, entry.path));
+        return plan;
+    }
+
+    private static void deleteImportBatch(File batch) {
+        File[] children = batch.listFiles();
+        if (children != null) for (File child : children) deleteImportBatch(child);
+        batch.delete();
+    }
+
     /** Each folder holding a mod.ini becomes <game root>/mods/<folder name>. */
     private Map<SourceEntry, File> planModInstall(List<SourceEntry> entries, String fallbackName) {
         List<String> roots = new ArrayList<>();
@@ -774,7 +963,7 @@ public final class LauncherActivity extends Activity {
 
     private InputStream openSourceStream(Uri uri) throws IOException {
         InputStream input = getContentResolver().openInputStream(uri);
-        if (input == null) throw new IOException("Cannot open the selected source");
+        if (input == null) throw new LocalizedIOException("error_io_read", uri);
         return input;
     }
 
@@ -811,7 +1000,7 @@ public final class LauncherActivity extends Activity {
             throws IOException {
         File parent = destination.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-            throw new IOException("Cannot create " + parent);
+            throw new LocalizedIOException("error_io_create", parent);
         }
         try (FileOutputStream output = new FileOutputStream(destination)) {
             byte[] buffer = new byte[256 * 1024];
@@ -1056,7 +1245,7 @@ public final class LauncherActivity extends Activity {
             lines.add(insertAt, name + " = " + changes.get(full));
         }
         File parent = file.getParentFile();
-        if (!parent.isDirectory() && !parent.mkdirs()) throw new IOException("Cannot create " + parent);
+        if (!parent.isDirectory() && !parent.mkdirs()) throw new LocalizedIOException("error_io_create", parent);
         File temporary = new File(parent, file.getName() + ".tmp");
         try (OutputStreamWriter writer = new OutputStreamWriter(new FileOutputStream(temporary), StandardCharsets.UTF_8)) {
             for (String line : lines) writer.write(line + "\n");
@@ -1075,7 +1264,7 @@ public final class LauncherActivity extends Activity {
             return;
         }
         File parent = file.getParentFile();
-        if (!parent.isDirectory() && !parent.mkdirs()) throw new IOException("Cannot create " + parent);
+        if (!parent.isDirectory() && !parent.mkdirs()) throw new LocalizedIOException("error_io_create", parent);
         try (OutputStreamWriter writer = new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8)) {
             writer.write(contents);
         }

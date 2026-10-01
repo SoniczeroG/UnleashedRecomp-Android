@@ -83,6 +83,8 @@ struct Installer
     static bool parseSources(const Input &input, Journal &journal, Sources &sources);
     static bool install(const Sources &sources, const std::filesystem::path &targetDirectory, bool skipHashChecks, Journal &journal, std::chrono::seconds endWaitTime, const std::function<bool()> &progressCallback);
     static void rollback(Journal &journal);
+    static bool recoverDLCInstall(const std::filesystem::path &root, std::string &error);
+    static bool installDLC(const Sources &sources, const std::filesystem::path &root, Journal &journal);
 
     // Convenience method for checking if the specified file contains the game. This should be used when the user selects the file.
     static bool parseGame(const std::filesystem::path &sourcePath);

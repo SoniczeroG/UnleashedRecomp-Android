@@ -221,6 +221,29 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
 
     // This is what SDL runs in. It invokes SDL_main(), eventually
     protected static Thread mSDLThread;
+    private static boolean gameStorageLocked;
+
+    static boolean isGameStorageLocked() {
+        return gameStorageLocked || (mSingleton != null && !mBrokenLibraries);
+    }
+
+    /** Called by native storage_android.cpp so every component uses the same root. */
+    public String getGameStoragePath() {
+        gameStorageLocked = true;
+        java.io.File root = AppStorage.activeGameRoot(this);
+        try {
+            AppStorage.validateRoot(this, root);
+            return root.getCanonicalPath();
+        } catch (java.io.IOException exception) {
+            throw new IllegalStateException(exception.getMessage(), exception);
+        }
+    }
+
+    /** Native installer dialogs follow Android's language, including Russian and Portuguese. */
+    public String getLocalizedMessage(String resourceName, String detail) {
+        int resource = getResources().getIdentifier(resourceName, "string", getPackageName());
+        return resource == 0 ? "" : getString(resource, detail);
+    }
 
     protected static SDLGenericMotionListener_API12 getMotionListener() {
         if (mMotionListener == null) {
@@ -407,6 +430,15 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
                 mCurrentLocale = getContext().getResources().getConfiguration().getLocales().get(0);
             }
         } catch(Exception ignored) {
+        }
+
+        // Landscape gameplay would otherwise leave a black bar over the display cutout:
+        // the platform default keeps window content out of the cutout in landscape,
+        // and only extends under it in portrait. Opt in explicitly on both edges.
+        if (Build.VERSION.SDK_INT >= 28 /* Android 9 (P) */) {
+            WindowManager.LayoutParams params = getWindow().getAttributes();
+            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(params);
         }
 
         setContentView(mLayout);

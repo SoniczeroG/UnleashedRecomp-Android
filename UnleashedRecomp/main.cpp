@@ -23,6 +23,9 @@
 #include <os/logger.h>
 #include <os/process.h>
 #include <os/registry.h>
+#ifdef __ANDROID__
+#include <os/android/storage_android.h>
+#endif
 #include <ui/game_window.h>
 #if !defined(__ANDROID__)
 #include <ui/installer_wizard.h>
@@ -329,44 +332,110 @@ int main(int argc, char *argv[])
     std::filesystem::path modulePath;
 
 #ifdef __ANDROID__
-    // PR #78: install a base-game ISO/container, title update and optional DLC
-    // packages staged by the Android launcher. Keep the staging directory on
-    // failure so the user can correct the source set without copying it again.
+    // Import base-game packages on first install and DLC on subsequent launches.
+    // ZIPs are unpacked into staging by the launcher, with wrapper folders intact.
     {
         const std::filesystem::path root = GetGamePath();
         const std::filesystem::path stagingDir = root / "to_install";
         std::error_code ec;
         const bool hasStaging = std::filesystem::is_directory(stagingDir, ec);
-        const bool gameAlreadyInstalled = Installer::checkGameInstall(root, modulePath);
-        if (hasStaging && !gameAlreadyInstalled)
+        const bool gameAlreadyInstalled = Installer::checkGameInstall(root, modulePath) ||
+            (std::filesystem::is_regular_file(root / "game/default.xex") &&
+             std::filesystem::is_regular_file(root / "update/default.xexp"));
+        std::string recoveryError;
+        if (!Installer::recoverDLCInstall(root, recoveryError))
+        {
+            LOGFN_ERROR("DLC recovery failed: {}", recoveryError);
+            const auto message = os::android::LocaliseMessage("installer_recovery_failed", "Unable to recover the previous DLC installation. Check the game storage and the log.");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(),
+                message.c_str(), GameWindow::s_pWindow);
+            std::_Exit(1);
+        }
+        bool hasPendingSources = false;
+        if (hasStaging)
+        {
+            for (std::filesystem::directory_iterator it(stagingDir, ec), end;
+                 !ec && it != end; it.increment(ec))
+                hasPendingSources |= it->path().extension() != ".part";
+        }
+        // An interrupted launcher copy leaves an unpublished .part batch.
+        // It must not prevent an already installed game from starting.
+        if (hasStaging && (hasPendingSources || ec))
         {
             Installer::Input input;
-            for (std::filesystem::directory_iterator it(stagingDir, ec), end; !ec && it != end; it.increment(ec))
-            {
-                const std::filesystem::path source = it->path();
-                if (input.gameSource.empty() && Installer::parseGame(source))
-                    input.gameSource = source;
-                else if (input.updateSource.empty() && Installer::parseUpdate(source))
-                    input.updateSource = source;
-                else if (Installer::parseDLC(source) != DLC::Unknown)
-                    input.dlcSources.push_back(source);
-            }
-
             Journal journal;
             Installer::Sources sources;
             bool installSucceeded = false;
-            if (ec)
+            const char *errorKey = "installer_failed";
+            std::string errorDetail;
+            auto fail = [&](const char *key, const std::string &diagnostic, const std::string &detail = std::string()) {
+                errorKey = key;
+                errorDetail = detail;
+                journal.lastErrorMessage = diagnostic;
+            };
+            try
             {
-                journal.lastErrorMessage = "Unable to enumerate the staged installer files: " + ec.message();
+                std::set<DLC> dlcTypes;
+                std::string invalidSource;
+                for (std::filesystem::recursive_directory_iterator it(stagingDir, ec), end;
+                     !ec && it != end; it.increment(ec))
+                {
+                    const auto source = it->path();
+                    const bool directory = it->is_directory();
+                    const auto extension = source.extension().string();
+                    if (extension == ".part")
+                    {
+                        if (directory) it.disable_recursion_pending();
+                        continue;
+                    }
+                    bool recognized = false;
+                    if (Installer::parseGame(source))
+                    {
+                        if (!input.gameSource.empty()) {
+                            errorKey = "installer_duplicate_game";
+                            throw std::runtime_error("Multiple base-game sources were selected.");
+                        }
+                        input.gameSource = source;
+                        recognized = true;
+                    }
+                    else if (Installer::parseUpdate(source))
+                    {
+                        if (!input.updateSource.empty()) {
+                            errorKey = "installer_duplicate_update";
+                            throw std::runtime_error("Multiple title-update sources were selected.");
+                        }
+                        input.updateSource = source;
+                        recognized = true;
+                    }
+                    else if (const DLC type = Installer::parseDLC(source); type != DLC::Unknown)
+                    {
+                        if (!dlcTypes.insert(type).second) {
+                            errorKey = "installer_duplicate_dlc";
+                            throw std::runtime_error("Multiple sources for the same DLC pack were selected.");
+                        }
+                        input.dlcSources.push_back(source);
+                        recognized = true;
+                    }
+                    if (recognized && directory) it.disable_recursion_pending();
+                    else if (!recognized && !directory && extension != ".txt" && extension != ".md" && extension != ".nfo")
+                        invalidSource = source.filename().string();
+                }
+
+                if (ec) fail("installer_io_failed", "Unable to read the staged files: " + ec.message());
+                else if (!invalidSource.empty()) fail("installer_source_invalid", "Unsupported or damaged installer source: " + invalidSource, invalidSource);
+                else if (gameAlreadyInstalled && (!input.gameSource.empty() || !input.updateSource.empty()))
+                    fail("installer_existing_game", "The base game is already installed. Import DLC packages separately.");
+                else if (!gameAlreadyInstalled && (input.gameSource.empty() || input.updateSource.empty()))
+                    fail("installer_need_game_update", "The staged files must contain both the base game and its title update.");
+                else if (gameAlreadyInstalled && input.dlcSources.empty())
+                    fail("installer_no_dlc", "No supported DLC packages were found in the staged files.");
+                else if (Installer::parseSources(input, journal, sources))
+                    installSucceeded = gameAlreadyInstalled ? Installer::installDLC(sources, root, journal)
+                        : Installer::install(sources, root, false, journal, std::chrono::seconds(0), [] { return true; });
             }
-            else if (input.gameSource.empty() || input.updateSource.empty())
+            catch (const std::exception &exception)
             {
-                journal.lastErrorMessage = "The staged files must contain both the base game and its title update.";
-            }
-            else if (Installer::parseSources(input, journal, sources))
-            {
-                installSucceeded = Installer::install(sources, root, false, journal,
-                    std::chrono::seconds(0), []() { return true; });
+                journal.lastErrorMessage = exception.what();
             }
 
             if (installSucceeded)
@@ -376,20 +445,31 @@ int main(int argc, char *argv[])
                 if (removeEc)
                     LOGFN_WARNING("Failed to remove ISO staging directory after installation: {}", removeEc.message());
 
-                const std::string resultText = Localise("IntegrityCheck_Success");
+                const std::string resultText = os::android::LocaliseMessage("installer_success", "Installer packages installed successfully.");
                 LOG("Installed the staged Android ISO/package sources successfully.");
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, GameWindow::GetTitle(),
                     resultText.c_str(), GameWindow::s_pWindow);
             }
             else
             {
-                Installer::rollback(journal);
+                if (!gameAlreadyInstalled) Installer::rollback(journal);
                 const std::string reason = journal.lastErrorMessage.empty()
                     ? "Unable to parse or install the staged game sources."
                     : journal.lastErrorMessage;
                 LOGFN_ERROR("Android ISO/package installation failed: {}", reason);
+                if (std::string_view(errorKey) == "installer_failed") {
+                    switch (journal.lastResult) {
+                    case Journal::Result::FileHashFailed: errorKey = "installer_hash_failed"; break;
+                    case Journal::Result::FileMissing:
+                    case Journal::Result::ValidationFileMissing: errorKey = "installer_missing_files"; break;
+                    case Journal::Result::DLCParsingFailed:
+                    case Journal::Result::UnknownDLCType: errorKey = "installer_unknown_dlc"; break;
+                    default: break;
+                    }
+                }
+                const auto message = os::android::LocaliseMessage(errorKey, reason.c_str(), errorDetail);
                 SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(),
-                    reason.c_str(), GameWindow::s_pWindow);
+                    message.c_str(), GameWindow::s_pWindow);
                 std::_Exit(1);
             }
         }
@@ -441,18 +521,10 @@ int main(int argc, char *argv[])
         // the game files (app-specific external storage, reachable from a PC over USB)
         // and exit; the directory has already been created by GetGamePath().
         {
-            char text[1024];
-            snprintf(text, sizeof(text),
-                "Game files not found.\n\n"
-                "Copy your Sonic Unleashed dump folders (game, update, dlc) into:\n\n"
-                "%s\n\n"
-                "Alternative: copy the game's iso, update and dlcs into:\n\n"
-                "%s/to_install\n\n"
-                "The folder is accessible from a PC over a USB cable.\n"
-                "Restart the app after copying.",
-                (const char *)GetGamePath().u8string().c_str(),
-                (const char *)GetGamePath().u8string().c_str());
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, GameWindow::GetTitle(), text, GameWindow::s_pWindow);
+            const auto message = os::android::LocaliseMessage("installer_game_missing",
+                "Game files not found. Import your Xbox 360 game and title update in the launcher.",
+                GetGamePath().string());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, GameWindow::GetTitle(), message.c_str(), GameWindow::s_pWindow);
         }
         std::_Exit(1);
 #endif

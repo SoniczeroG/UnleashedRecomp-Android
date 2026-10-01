@@ -113,14 +113,14 @@ public final class ModSettingsActivity extends Activity {
 
     private void loadSchema(File schemaFile) throws Exception {
         if (!schemaFile.isFile() || schemaFile.length() <= 0 || schemaFile.length() > MAX_SCHEMA_BYTES) {
-            throw new IOException("Invalid or oversized ConfigSchemaFile");
+            throw new LocalizedIOException("error_schema_size", null);
         }
-        JSONObject schema = new JSONObject(readText(schemaFile));
+        JSONObject schema = new JSONObject(ModSchemaJson.normalize(readText(schemaFile)));
         configFile = resolveInsideMod(schema.optString("IniFile", "config.ini"));
         Map<String, Map<String, String>> current = readIni(configFile);
         JSONObject enums = schema.optJSONObject("Enums");
         JSONArray groups = schema.optJSONArray("Groups");
-        if (groups == null) throw new IOException("Config schema has no Groups array");
+        if (groups == null) throw new LocalizedIOException("error_schema_groups", null);
 
         for (int groupIndex = 0; groupIndex < groups.length(); groupIndex++) {
             JSONObject group = groups.optJSONObject(groupIndex);
@@ -134,7 +134,7 @@ public final class ModSettingsActivity extends Activity {
             JSONArray elements = group.optJSONArray("Elements");
             if (elements == null) continue;
             for (int elementIndex = 0; elementIndex < elements.length(); elementIndex++) {
-                if (fields.size() >= MAX_FIELDS) throw new IOException("Config schema has too many fields");
+                if (fields.size() >= MAX_FIELDS) throw new LocalizedIOException("error_schema_fields", null);
                 JSONObject element = elements.optJSONObject(elementIndex);
                 if (element == null) continue;
                 addField(section, element, enums, current.get(section));
@@ -231,27 +231,27 @@ public final class ModSettingsActivity extends Activity {
         if (field.input instanceof Spinner) {
             int index = ((Spinner) field.input).getSelectedItemPosition();
             if (field.choices == null || index < 0 || index >= field.choices.size()) {
-                throw new IOException(field.name + ": no enum value selected");
+                throw new LocalizedIOException("error_mod_enum", field.name);
             }
             return field.choices.get(index).value;
         }
         String value = ((EditText) field.input).getText().toString();
         if (value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('"') >= 0) {
-            throw new IOException(field.name + ": quotes and newlines are not supported");
+            throw new LocalizedIOException("error_mod_value", field.name);
         }
         if ("int".equals(field.type) || "float".equals(field.type)) {
             double number;
             try {
                 number = Double.parseDouble(value);
             } catch (NumberFormatException exception) {
-                throw new IOException(field.name + ": invalid number");
+                throw new LocalizedIOException("error_mod_number", field.name);
             }
             if ((field.min != null && number < field.min) ||
                     (field.max != null && number > field.max)) {
-                throw new IOException(field.name + ": value is outside the allowed range");
+                throw new LocalizedIOException("error_mod_range", field.name);
             }
             if ("int".equals(field.type)) {
-                if (number != Math.rint(number)) throw new IOException(field.name + ": integer required");
+                if (number != Math.rint(number)) throw new LocalizedIOException("error_mod_integer", field.name);
                 return Long.toString((long) number);
             }
         }
@@ -263,7 +263,7 @@ public final class ModSettingsActivity extends Activity {
         File root = modRoot.getCanonicalFile();
         File target = new File(root, relativePath).getCanonicalFile();
         String rootPrefix = root.getPath() + File.separator;
-        if (!target.getPath().startsWith(rootPrefix)) throw new IOException("Config path escapes the mod folder");
+        if (!target.getPath().startsWith(rootPrefix)) throw new LocalizedIOException("error_mod_path", null);
         return target;
     }
 
@@ -271,7 +271,7 @@ public final class ModSettingsActivity extends Activity {
         value = value != null ? value.trim() : "";
         if (value.isEmpty() || value.indexOf(']') >= 0 || value.indexOf('[') >= 0 ||
             value.indexOf('=') >= 0 || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
-            throw new IOException("Invalid config section or key name");
+            throw new LocalizedIOException("error_mod_name", null);
         }
         return value;
     }
@@ -396,7 +396,7 @@ public final class ModSettingsActivity extends Activity {
     private static void writeAtomic(File target, String contents) throws IOException {
         File parent = target.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-            throw new IOException("Cannot create " + parent);
+            throw new LocalizedIOException("error_io_create", parent);
         }
         File temporary = new File(parent, target.getName() + ".tmp");
         try (FileOutputStream output = new FileOutputStream(temporary);
@@ -415,8 +415,14 @@ public final class ModSettingsActivity extends Activity {
         }
     }
 
-    private static String readableError(Exception exception) {
-        return exception.getMessage() != null ? exception.getMessage() : exception.getClass().getSimpleName();
+    private String readableError(Exception exception) {
+        String message = FileErrorMessages.describe(this, exception);
+        // Android JSONTokener appends the whole input to syntax errors.
+        if (exception instanceof org.json.JSONException) {
+            java.util.regex.Matcher position = java.util.regex.Pattern.compile("at character ([0-9]+)").matcher(message);
+            return getString(R.string.error_schema_invalid, position.find() ? position.group(1) : "?");
+        }
+        return message.length() > 240 ? message.substring(0, 240) + "…" : message;
     }
 
     private TextView text(String value, int size, boolean bold) {

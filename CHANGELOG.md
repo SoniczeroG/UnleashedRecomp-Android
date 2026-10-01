@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 (2026-10-01)
+
+- Fixed DLC imports after the base game is installed, including DLC-only ZIPs/folders and ZIPs left in to_install by older builds (issue #162). Packs are hash-checked in a temporary tree before replacement; previous packs can be recovered after an interrupted replacement.
+- Accepted HMM JSON schemas with trailing commas, comments and a UTF-8 BOM; schema errors no longer dump the complete file (issue #93).
+- Added a persisted game-storage choice for internal memory, app folders and Android/media folders on mounted volumes, including SD cards. Optional verified copying keeps the original game, mods, settings and saves (issue #90).
+- Completed Android launcher translations in English, Russian, German, Spanish, French, Italian, Japanese and Portuguese, including mod settings, updates, storage selection and localized file/installer errors.
+- Fixed overlapping guest memory copies with `memmove`, addressing the ring crash and broken collision triggers (PR #158).
+- Removed the earlier small-block quarantine and collision repair workarounds alongside that fix (PR #158).
+- Extended landscape gameplay into the display-cutout area (PR #153).
+- Fixed fresh-clone builds by restoring zstd's CMake sources and executable permissions on build tools (PR #159).
+- Added puopg (Michael Chen) and vladector to the Android port's Credits.
+
+This build is based on `main` at `4e19e48f`. The Adreno 8xx driver and POCO F8 Ultra audio presets described in the published 0.5.3 release are not present in that source tree.
+
 ## 0.5.2 (2026-07-13)
 
 Version 0.5.2 replaces the withdrawn 0.5.1 APK. It contains every user-facing change from 0.5.1, removes performance instrumentation that was unintentionally left enabled there, and adds the features below.

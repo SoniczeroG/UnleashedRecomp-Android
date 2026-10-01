@@ -4,12 +4,42 @@
 
 #include <SDL.h>
 #include <SDL_system.h>
+#include <jni.h>
 
 #include <cstdio>
 #include <cstdlib>
 
 namespace os::android
 {
+    std::string LocaliseMessage(const char *resourceName, const char *fallback, const std::string &detail)
+    {
+        JNIEnv *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+        jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());
+        std::string result;
+        if (env && activity)
+        {
+            jclass activityClass = env->GetObjectClass(activity);
+            jmethodID method = env->GetMethodID(activityClass, "getLocalizedMessage",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+            jstring key = env->NewStringUTF(resourceName);
+            jstring argument = env->NewStringUTF(detail.c_str());
+            jstring text = method ? static_cast<jstring>(env->CallObjectMethod(activity, method, key, argument)) : nullptr;
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            else if (text)
+            {
+                const char *chars = env->GetStringUTFChars(text, nullptr);
+                if (chars) result = chars;
+                if (chars) env->ReleaseStringUTFChars(text, chars);
+            }
+            if (text) env->DeleteLocalRef(text);
+            env->DeleteLocalRef(argument);
+            env->DeleteLocalRef(key);
+            env->DeleteLocalRef(activityClass);
+        }
+        if (activity && env) env->DeleteLocalRef(activity);
+        return result.empty() ? std::string(fallback) : result;
+    }
+
     // A directory can exist but be unusable: e.g. created via `adb shell mkdir` it's owned
     // by the shell uid, and the app gets EACCES through FUSE. std::filesystem calls on such
     // paths throw all over the codebase (Config::Load etc.), so catch this case up front.
@@ -81,76 +111,37 @@ namespace os::android
     {
         static std::filesystem::path root = []() -> std::filesystem::path
         {
-            std::error_code ec;
-
-            // Legacy layout: game files pushed over adb straight into internal app storage.
-            // Keep using it when populated so existing installs are unaffected. Resolved at
-            // runtime so it always tracks the installed package id.
-            std::filesystem::path legacy = !GetInternalFilesDir().empty()
-                ? GetInternalFilesDir() / "UnleashedRecomp"
-                : std::filesystem::path(GAME_INSTALL_DIRECTORY);
-            if (std::filesystem::exists(legacy / "game", ec))
-                return legacy;
-
-            const std::filesystem::path &external = GetExternalFilesDir();
-
-            // Android/media fallback: on-device file managers can browse it on Android 11+
-            // (unlike Android/data), so phone-only users can drop game files there. Only
-            // picked when populated; external app storage stays the default target.
-            const std::filesystem::path &media = GetExternalMediaDir();
-            if (!media.empty())
+            JNIEnv *env = static_cast<JNIEnv *>(SDL_AndroidGetJNIEnv());
+            jobject activity = static_cast<jobject>(SDL_AndroidGetActivity());
+            std::string selected;
+            if (env && activity)
             {
-                std::filesystem::path mediaRoot = media / "UnleashedRecomp";
-                bool externalPopulated = !external.empty() &&
-                    std::filesystem::exists(external / "UnleashedRecomp" / "game", ec);
-                if (!externalPopulated && std::filesystem::exists(mediaRoot / "game", ec) &&
-                    ProbeDirWritable(mediaRoot))
+                jclass activityClass = env->GetObjectClass(activity);
+                jmethodID method = env->GetMethodID(activityClass, "getGameStoragePath", "()Ljava/lang/String;");
+                jstring path = method ? static_cast<jstring>(env->CallObjectMethod(activity, method)) : nullptr;
+                if (env->ExceptionCheck())
                 {
-                    return mediaRoot;
+                    env->ExceptionClear();
                 }
+                else if (path)
+                {
+                    const char *chars = env->GetStringUTFChars(path, nullptr);
+                    if (chars) selected = chars;
+                    if (chars) env->ReleaseStringUTFChars(path, chars);
+                }
+                if (path) env->DeleteLocalRef(path);
+                env->DeleteLocalRef(activityClass);
+                env->DeleteLocalRef(activity);
             }
-
-            if (!external.empty())
+            if (selected.empty() || !ProbeDirWritable(selected))
             {
-                std::filesystem::path result = external / "UnleashedRecomp";
-                std::filesystem::create_directories(result, ec);
-
-                // Create the media folder too so it is discoverable from an on-device file
-                // manager, and keep the media scanner away from game assets placed there.
-                if (!media.empty())
-                {
-                    std::filesystem::create_directories(media / "UnleashedRecomp", ec);
-                    std::filesystem::path noMedia = media / ".nomedia";
-                    if (!std::filesystem::exists(noMedia, ec))
-                    {
-                        if (FILE *file = fopen(noMedia.c_str(), "wb"))
-                            fclose(file);
-                    }
-                }
-
-                if (!ProbeDirWritable(result))
-                {
-                    // Refuse to continue with a poisoned directory - later std::filesystem
-                    // calls would throw an uncaught exception with no explanation.
-                    char text[1024];
-                    snprintf(text, sizeof(text),
-                        "The storage folder is not accessible:\n\n%s\n\n"
-                        "It was likely created by another tool (e.g. adb shell), so the "
-                        "app cannot write to it. Delete the folder from a PC or file "
-                        "manager and restart the app.",
-                        result.string().c_str());
-                    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Unleashed Recomp", text, nullptr);
-                    std::_Exit(1);
-                }
-
-                return result;
+                const auto message = LocaliseMessage("storage_native_unavailable",
+                    "The selected game storage is unavailable or not writable. Reconnect the SD card or choose another storage location in the launcher.");
+                SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Unleashed Recomp",
+                    message.c_str(), nullptr);
+                std::_Exit(1);
             }
-
-            // External storage unavailable (shouldn't happen on real devices) - stay
-            // functional on internal storage.
-            std::filesystem::path result = GetInternalFilesDir() / "UnleashedRecomp";
-            std::filesystem::create_directories(result, ec);
-            return result;
+            return std::filesystem::path(selected);
         }();
 
         return root;

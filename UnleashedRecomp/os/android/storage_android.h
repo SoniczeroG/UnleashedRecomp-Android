@@ -1,9 +1,11 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace os::android
 {
+    std::string LocaliseMessage(const char *resourceName, const char *fallback, const std::string &detail = {});
     // App-private internal files directory (e.g. /data/user/0/org.libsdl.app/files).
     // Empty if SDL/JNI is not ready yet, so never call this from a static initializer.
     const std::filesystem::path & GetInternalFilesDir();
@@ -18,10 +20,8 @@ namespace os::android
     // so users can drop game files there without a PC. Empty if unavailable.
     const std::filesystem::path & GetExternalMediaDir();
 
-    // Root directory for game files and user data (config/saves). Prefers the legacy
-    // internal install layout (game files pushed over adb before the APK became
-    // distributable), then a populated "UnleashedRecomp" directory on external app
-    // storage, then a populated one under Android/media; defaults to external app
-    // storage, which users can populate from a PC without root.
+    // Root for game files, mods, config and saves. Queries the launcher's shared
+    // AppStorage policy over JNI, including a persisted storage-volume choice.
+    // Fixed for the game session; unavailable selected storage is an error.
     const std::filesystem::path & GetDataRoot();
 }
